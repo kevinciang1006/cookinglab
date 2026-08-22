@@ -18,10 +18,6 @@ export async function POST(request: Request) {
   }
 
   const appPassword = process.env.APP_PASSWORD;
-  // TEMP DEBUG (login-auth-diagnosis, remove after): confirm APP_PASSWORD is
-  // actually loaded in the deployed process — undefined here would make
-  // every password "wrong" silently.
-  console.log(`[login debug] APP_PASSWORD defined: ${appPassword !== undefined}`);
   if (!appPassword) {
     return NextResponse.json(
       { ok: false, error: "Server isn't configured with a password yet." },
@@ -29,23 +25,17 @@ export async function POST(request: Request) {
     );
   }
 
-  const matched = typeof password === "string" && password === appPassword;
-  // TEMP DEBUG (login-auth-diagnosis, remove after):
-  console.log(`[login debug] password matched: ${matched}`);
-  if (!matched) {
+  if (typeof password !== "string" || password !== appPassword) {
     return NextResponse.json({ ok: false, error: "Wrong password." }, { status: 401 });
   }
 
-  const secure = isRequestHttps(request);
   const response = NextResponse.json({ ok: true });
   response.cookies.set(AUTH_COOKIE_NAME, await hashAppPassword(appPassword), {
     httpOnly: true,
-    secure,
+    secure: isRequestHttps(request),
     sameSite: "lax",
     path: "/",
     maxAge: COOKIE_MAX_AGE,
   });
-  // TEMP DEBUG (login-auth-diagnosis, remove after):
-  console.log(`[login debug] cookie set — secure: ${secure}, sameSite: lax, path: /`);
   return response;
 }
