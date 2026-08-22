@@ -1,0 +1,51 @@
+name: Deploy
+
+# Deploys to the self-hosted runner on the Mac mini on every push to main.
+# No secrets live in this workflow: the app reads its config from .env.local,
+# which already lives on the mini and is gitignored (never checked out from
+# the repo). For that to keep working, .env.local must sit in the SAME
+# directory this workflow builds and runs the app from — this workflow never
+# hardcodes a path like ~/apps/cookinglab; every step below runs in the
+# runner's actual checkout dir for this repo (github.workspace, whatever
+# that resolves to on the mini), and pm2 is started from that same cwd so
+# there's only one directory in play. If .env.local currently lives
+# somewhere else (e.g. ~/apps/cookinglab) and that's NOT this runner's
+# workspace, copy/symlink .env.local into the workspace once, or configure
+# the runner's work folder to be ~/apps/cookinglab — otherwise the app will
+# start without its config.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # actions/checkout defaults to clean: true, which runs
+          # `git clean -ffdx` before checking out — the `-x` removes files
+          # ignored by .gitignore too, which would delete .env.local on
+          # every single deploy. clean: false leaves untracked/gitignored
+          # files (.env.local) alone.
+          clean: false
+
+      - name: Verify .env.local is present
+        run: |
+          if [ ! -f .env.local ]; then
+            echo "::error::.env.local not found in $(pwd). This is the runner's workspace for cookinglab — put .env.local here (not just in ~/apps/cookinglab) so the build/runtime can read it."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Restart app with pm2
+        run: pm2 restart cookinglab || pm2 start "npm run start" --name cookinglab
+
+      - name: Save pm2 process list
+        run: pm2 save
