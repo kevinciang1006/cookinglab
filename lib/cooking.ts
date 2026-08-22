@@ -1,7 +1,7 @@
 import "server-only";
 
 import { createClient } from "@supabase/supabase-js";
-import { chat, embed, composeEmbedText, OllamaUnavailableError } from "@/lib/ollama";
+import { chat, chatStream, embed, composeEmbedText, OllamaUnavailableError } from "@/lib/ollama";
 
 export { OllamaUnavailableError } from "@/lib/ollama";
 
@@ -41,15 +41,84 @@ export const EMBED_MODEL = "nomic-embed-text";
 // embeddings, so re-check this if borderline queries start misfiring.
 export const RELEVANCE_THRESHOLD = 0.6;
 
-const ANSWER_PROMPT = `You are answering questions about the user's own cooking log.
-You will be given a question and a set of retrieved log entries (attempts).
-Rules:
-- Answer ONLY from the provided attempts. Do not use outside cooking knowledge.
-- Reference which attempt(s) support each claim (by dish + what happened).
-- If the retrieved attempts don't actually answer the question, say so plainly
-  rather than stretching.
-- Be concise and practical — this is the user's own lab notebook talking back
-  to them.`;
+const ANSWER_PROMPT = `You are answering questions about the user's own cooking log — their
+personal lab notebook talking back to them. You will be given a question
+and a set of retrieved log entries (attempts) that are relevant to it.
+
+Grounding rules (non-negotiable):
+- Reference which attempt(s) support each claim, by dish + what happened.
+- Never invent a result, rating, or detail the log doesn't actually contain.
+- If the retrieved attempts don't actually answer the question, say so
+  plainly rather than stretching.
+
+When the question is asking how to make something ("how do I make X",
+"remind me how to make X", "what's my recipe for X"), be comprehensive and
+practical — a full, cookable recipe, not a summary paragraph — and follow
+this exact template:
+
+## <Dish Name>
+<one-line intro grounded in the log — what attempt(s) this recipe comes from>
+
+### Ingredients
+| Ingredient | Amount |
+|---|---|
+<one row per ingredient — if the log never specifies an amount, fill it in
+with ordinary cooking knowledge and say so in that row, e.g. "not in your
+log — typically 1 tsp">
+
+### Steps
+1. <step, grounded in what the attempts actually did>
+2. <step — **bold** the specific move or warning that caused a bad result
+   in the log when skipped or gotten wrong>
+...
+
+### From your log
+- <one bullet per specific fix or hard-won lesson pulled from the attempts
+  — in the user's own terms, not generic technique advice>
+
+Reconstruct the complete recipe even if the log only has scattered
+notes/outcomes rather than one clean write-up — anchor every part you can
+on what the attempts actually say (best-known ratios, timings, methods).
+
+Here is a fully worked example of the exact format to produce (a different
+dish, purely to show the shape — do not reuse any of its specifics):
+
+## Pan-Seared Steak
+Grounded in your logged attempts — you landed on a reverse-sear method
+(attempt 2) after a straight pan-sear came out uneven (attempt 1).
+
+### Ingredients
+| Ingredient | Amount |
+|---|---|
+| Ribeye steak, 1-1.5in thick | 1 (about 400g) |
+| Kosher salt | 1 tsp |
+| Black pepper | 1/2 tsp |
+| Neutral oil | 1 tbsp |
+| Butter | 1 tbsp |
+| Garlic cloves, smashed | 2 |
+| Thyme sprigs | not in your log — 2 sprigs is typical |
+
+### Steps
+1. Salt the steak generously and rest uncovered in the fridge for at least
+   1 hour (attempt 2) — **skipping this dried the surface less and gave a
+   worse crust in attempt 1.**
+2. Oven at 120°C (250°F) until the steak hits an internal temp of 49°C
+   (120°F), about 25-30 minutes.
+3. Heat oil in a heavy pan until just smoking. **Sear 60-90 seconds per
+   side, undisturbed** — this is the step attempt 1 rushed, leading to a
+   gray, uneven crust.
+4. Add butter, garlic, and thyme; tilt the pan and baste for 30-60 seconds.
+5. Rest 5 minutes before slicing.
+
+### From your log
+- Reverse-searing (oven first, then a hard sear) gave far more even
+  edge-to-edge doneness than starting in the pan (attempt 2 vs. attempt 1).
+- Not moving the steak during the sear was the fix for the patchy crust
+  from attempt 1.
+
+For anything else — why something happened, what's worked before, general
+questions about the log — answer directly and concisely; use the template
+above only for "how do I make X" questions, not by default.`;
 
 // v1c agent upgrade: classify intent, then route to one of three synthesis
 // prompts. RETRIEVE reuses ANSWER_PROMPT above unchanged.
@@ -354,6 +423,35 @@ async function callModel(params: {
 }
 
 /**
+ * Streaming sibling of callModel — for the final prose answer only
+ * (RETRIEVE/ADAPT/GENERATE), never for JSON-expecting calls. Yields text
+ * chunks as they generate; OllamaUnavailableError propagates unchanged
+ * (mid-stream, so the route surfaces it as an SSE error event rather than
+ * an HTTP error — headers are already committed by the time streaming
+ * starts). Any other failure is wrapped in `errorClass`, same as callModel.
+ */
+async function* callModelStream(params: {
+  model: string;
+  contents: string;
+  systemInstruction: string;
+  label: string;
+  errorClass: new (message: string) => Error;
+  temperature?: number;
+}): AsyncGenerator<string, void, unknown> {
+  try {
+    yield* chatStream(params.model, params.systemInstruction, params.contents, {
+      temperature: params.temperature,
+      think: false,
+    });
+  } catch (err) {
+    if (err instanceof OllamaUnavailableError) throw err;
+    throw new params.errorClass(
+      `Ollama ${params.label} stream request failed (model=${params.model}): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
+/**
  * Sends a freeform cooking message to the model and returns the parsed
  * structured result, or `{ skip: true }` for non-cooking messages. Throws
  * ParserError on any model or JSON-parsing failure (FR5), or
@@ -498,8 +596,29 @@ export async function synthesizeAnswer(
     systemInstruction: ANSWER_PROMPT,
     label: "answer",
     errorClass: AnswerError,
+    // Low and steady — the template + worked example only pay off if the
+    // model reliably reproduces the structure rather than wandering.
+    temperature: 0.3,
   });
   return text.trim();
+}
+
+/** Streaming sibling of synthesizeAnswer — same grounding/prompt, chunked. */
+export function synthesizeAnswerStream(
+  question: string,
+  matches: AttemptMatch[]
+): AsyncGenerator<string, void, unknown> {
+  const context = matches.map(formatMatchForPrompt).join("\n\n");
+  const userContent = `Question: ${question}\n\nRelevant log entries:\n${context}`;
+
+  return callModelStream({
+    model: ANSWER_MODEL,
+    contents: userContent,
+    systemInstruction: ANSWER_PROMPT,
+    label: "answer",
+    errorClass: AnswerError,
+    temperature: 0.3,
+  });
 }
 
 /** Pings the database — used by the Vercel cron keep-alive route. */
@@ -617,6 +736,23 @@ export async function synthesizeAdaptation(
   return text.trim();
 }
 
+/** Streaming sibling of synthesizeAdaptation — same grounding/prompt, chunked. */
+export function synthesizeAdaptationStream(
+  question: string,
+  matches: AttemptMatch[]
+): AsyncGenerator<string, void, unknown> {
+  const context = matches.map(formatMatchForPrompt).join("\n\n");
+  const userContent = `Question: ${question}\n\nRelevant log entries:\n${context}`;
+
+  return callModelStream({
+    model: ANSWER_MODEL,
+    contents: userContent,
+    systemInstruction: ADAPT_PROMPT,
+    label: "adapt",
+    errorClass: AnswerError,
+  });
+}
+
 /**
  * GENERATE path: a novel suggestion not grounded in the log, allowed to use
  * outside cooking knowledge. Caller is responsible for marking the answer
@@ -631,6 +767,17 @@ export async function synthesizeGenerated(question: string): Promise<string> {
     errorClass: AnswerError,
   });
   return text.trim();
+}
+
+/** Streaming sibling of synthesizeGenerated — same prompt, chunked. */
+export function synthesizeGeneratedStream(question: string): AsyncGenerator<string, void, unknown> {
+  return callModelStream({
+    model: GENERATE_MODEL,
+    contents: question,
+    systemInstruction: GENERATE_PROMPT,
+    label: "generate",
+    errorClass: AnswerError,
+  });
 }
 
 /** Classifies a freshly generated recipe's dish name + kind (for distill-back). */

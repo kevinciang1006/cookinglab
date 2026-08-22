@@ -4,9 +4,9 @@ import {
   parseLog,
   insertAttempt,
   matchAttempts,
-  synthesizeAnswer,
-  synthesizeAdaptation,
-  synthesizeGenerated,
+  synthesizeAnswerStream,
+  synthesizeAdaptationStream,
+  synthesizeGeneratedStream,
   synthesizeCookRecipe,
   classifyAskIntent,
   classifyChatIntent,
@@ -26,6 +26,10 @@ export type ChatResponse =
   | { type: "cook"; recipe: CookRecipe }
   | { type: "ask"; path: AskPath; answer: string; matches: AttemptMatch[]; savable: boolean };
 
+// Everything about an "ask" response except the answer text itself — sent
+// as the first SSE event, before the answer starts streaming in behind it.
+export type ChatStreamMeta = Omit<Extract<ChatResponse, { type: "ask" }>, "answer">;
+
 const MATCH_COUNT = 8;
 
 // Shown instead of the generic failure message specifically when Ollama
@@ -35,6 +39,50 @@ const UNAVAILABLE_MESSAGE = "Local model unavailable — is Ollama running?";
 
 function askError(answer: string): ChatResponse {
   return { type: "ask", path: "RETRIEVE", answer, matches: [], savable: false };
+}
+
+function sseEvent(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * Streams a prose answer as Server-Sent Events: a "meta" event with
+ * everything but the answer text, then one "delta" event per chunk as the
+ * model generates, then "done" — or an "error" event in place of "done" if
+ * the model call fails mid-stream (headers are already committed 200 by
+ * the time streaming starts, so a failure can't become an HTTP error status
+ * — the client treats an "error" event as the terminal state instead).
+ * Only the final prose answer generation streams; intent classification and
+ * retrieval already ran (synchronously, above) before this is called.
+ */
+function streamAskResponse(meta: ChatStreamMeta, chunks: AsyncGenerator<string, void, unknown>): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      controller.enqueue(encoder.encode(sseEvent("meta", meta)));
+      try {
+        for await (const chunk of chunks) {
+          controller.enqueue(encoder.encode(sseEvent("delta", { text: chunk })));
+        }
+        controller.enqueue(encoder.encode(sseEvent("done", {})));
+      } catch (err) {
+        console.error("chat answer stream failed:", err);
+        const message =
+          err instanceof OllamaUnavailableError ? UNAVAILABLE_MESSAGE : "Couldn't answer that — try again in a bit.";
+        controller.enqueue(encoder.encode(sseEvent("error", { message })));
+      } finally {
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
 
 /**
@@ -147,36 +195,26 @@ export async function POST(request: Request) {
     const path: AskPath =
       relevant.length === 0 ? "GENERATE" : await classifyAskIntent(contextualMessage, relevant);
 
+    // From here on, only the prose answer itself streams — intent
+    // classification and retrieval already happened above.
     if (path === "GENERATE") {
-      const answer = await synthesizeGenerated(contextualMessage);
-      return NextResponse.json<ChatResponse>({
-        type: "ask",
-        path: "GENERATE",
-        answer,
-        matches: [],
-        savable: true,
-      });
+      return streamAskResponse(
+        { type: "ask", path: "GENERATE", matches: [], savable: true },
+        synthesizeGeneratedStream(contextualMessage)
+      );
     }
 
     if (path === "ADAPT") {
-      const answer = await synthesizeAdaptation(contextualMessage, relevant);
-      return NextResponse.json<ChatResponse>({
-        type: "ask",
-        path: "ADAPT",
-        answer,
-        matches: relevant,
-        savable: false,
-      });
+      return streamAskResponse(
+        { type: "ask", path: "ADAPT", matches: relevant, savable: false },
+        synthesizeAdaptationStream(contextualMessage, relevant)
+      );
     }
 
-    const answer = await synthesizeAnswer(contextualMessage, relevant);
-    return NextResponse.json<ChatResponse>({
-      type: "ask",
-      path: "RETRIEVE",
-      answer,
-      matches: relevant,
-      savable: false,
-    });
+    return streamAskResponse(
+      { type: "ask", path: "RETRIEVE", matches: relevant, savable: false },
+      synthesizeAnswerStream(contextualMessage, relevant)
+    );
   } catch (err) {
     console.error("chat failed:", err);
     return NextResponse.json<ChatResponse>(

@@ -2,8 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import type { Attempt, AttemptKind, CookRecipe } from "@/lib/cooking";
-import { ChatPanel, CookModeScreen, RatingChip } from "@/app/components/shared";
+import type { Attempt, AttemptKind } from "@/lib/cooking";
+import { ChatPanel, CookDrawer, RatingChip, type CookModeData } from "@/app/components/shared";
 
 type TabId = "chat" | "recent";
 
@@ -35,7 +35,7 @@ type EditDraft = {
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<TabId>("chat");
-  const [cookRecipe, setCookRecipe] = useState<CookRecipe | null>(null);
+  const [cookRecipe, setCookRecipe] = useState<CookModeData | null>(null);
 
   const [recent, setRecent] = useState<Attempt[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
@@ -115,60 +115,60 @@ export default function Home() {
     }
   }
 
-  // Cook-mode takes over the whole view — a different mode, not a card in
-  // the feed. Short-circuit the entire tabbed shell while it's active.
-  if (cookRecipe) {
-    return <CookModeScreen recipe={cookRecipe} onExit={() => setCookRecipe(null)} />;
-  }
-
   return (
-    <div className="flex h-dvh flex-col bg-paper">
-      <header className="mx-auto w-full max-w-2xl px-4 pt-4 pb-2 sm:pt-8 sm:pb-4">
-        <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-ink-faint">
-          Cooking Lab
-        </p>
-        <h1 className="mt-0.5 text-xl font-semibold tracking-tight text-ink sm:text-2xl">
-          {TAB_TITLES[activeTab]}
-        </h1>
-      </header>
+    // Cook mode is a drawer alongside this, not a takeover — see CookDrawer:
+    // a flex sibling here, fixed full-screen on mobile via its own classes.
+    <div className="flex h-dvh bg-paper">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="mx-auto w-full max-w-2xl px-4 pt-4 pb-2 sm:pt-8 sm:pb-4">
+          <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-ink-faint">
+            Cooking Lab
+          </p>
+          <h1 className="mt-0.5 text-xl font-semibold tracking-tight text-ink sm:text-2xl">
+            {TAB_TITLES[activeTab]}
+          </h1>
+        </header>
 
-      <nav className="mx-auto hidden w-full max-w-2xl px-4 pb-4 sm:block">
-        <TabBar activeTab={activeTab} onChange={setActiveTab} />
-      </nav>
+        <nav className="mx-auto hidden w-full max-w-2xl px-4 pb-4 sm:block">
+          <TabBar activeTab={activeTab} onChange={setActiveTab} />
+        </nav>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex w-full max-w-2xl flex-col px-4 pb-28 sm:pb-10">
-          {activeTab === "chat" && (
-            <ChatPanel
-              onLogged={refreshRecent}
-              onCookRecipe={setCookRecipe}
-              placeholder="Log a cook, or ask about your log…"
-              emptyTitle="Log a cook, or ask about your log — try either:"
-              emptyExample="siobak attempt 4, oven 180 last 10 min, crackling worked, 8/10"
-            />
-          )}
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className="mx-auto flex w-full max-w-2xl flex-col px-4 pb-28 sm:pb-10">
+            {activeTab === "chat" && (
+              <ChatPanel
+                onLogged={refreshRecent}
+                onCookRecipe={setCookRecipe}
+                placeholder="Log a cook, or ask about your log…"
+                emptyTitle="Log a cook, or ask about your log — try either:"
+                emptyExample="siobak attempt 4, oven 180 last 10 min, crackling worked, 8/10"
+              />
+            )}
 
-          {activeTab === "recent" && (
-            <RecentTab
-              recent={recent}
-              loading={recentLoading}
-              editingId={editingId}
-              editDraft={editDraft}
-              editSaving={editSaving}
-              deletingId={deletingId}
-              onEdit={startEdit}
-              onCancelEdit={cancelEdit}
-              onSaveEdit={saveEdit}
-              onChangeDraft={setEditDraft}
-              onDelete={handleDelete}
-            />
-          )}
+            {activeTab === "recent" && (
+              <RecentTab
+                recent={recent}
+                loading={recentLoading}
+                editingId={editingId}
+                editDraft={editDraft}
+                editSaving={editSaving}
+                deletingId={deletingId}
+                onEdit={startEdit}
+                onCancelEdit={cancelEdit}
+                onSaveEdit={saveEdit}
+                onChangeDraft={setEditDraft}
+                onDelete={handleDelete}
+              />
+            )}
+          </div>
         </div>
+
+        <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-hairline bg-card/95 pb-[env(safe-area-inset-bottom)] backdrop-blur sm:hidden">
+          <TabBar activeTab={activeTab} onChange={setActiveTab} variant="bottom" />
+        </nav>
       </div>
 
-      <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-hairline bg-card/95 pb-[env(safe-area-inset-bottom)] backdrop-blur sm:hidden">
-        <TabBar activeTab={activeTab} onChange={setActiveTab} variant="bottom" />
-      </nav>
+      {cookRecipe && <CookDrawer recipe={cookRecipe} onExit={() => setCookRecipe(null)} />}
     </div>
   );
 }

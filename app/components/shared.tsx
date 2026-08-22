@@ -1,9 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import type { Attempt, AttemptMatch, AskPath, CookRecipe } from "@/lib/cooking";
-import type { ChatResponse } from "@/app/api/chat/route";
+import { useEffect, useRef, useState } from "react";
+import type { Attempt, AttemptMatch, AskPath } from "@/lib/cooking";
+import type { ChatResponse, ChatStreamMeta } from "@/app/api/chat/route";
 import { generateId } from "@/lib/id";
+import { MarkdownMessage } from "@/app/components/MarkdownMessage";
+import { parseRecipeMarkdown, type ParsedRecipe } from "@/lib/parseRecipeMarkdown";
+
+// Cook-mode's own data shape — a superset of the backend's CookRecipe with
+// the user's own logged learnings attached, whichever path produced it: the
+// dedicated cook-along backend flow (learnings: [], nothing to attach) or
+// "Let's cook this" on a regular answer card (learnings from that answer's
+// blockquote callouts, via parseRecipeMarkdown).
+export type CookModeData = ParsedRecipe;
 
 // ---------------------------------------------------------------------------
 // Shared across the main Chat tab and dish detail pages (v1d): the chat
@@ -143,7 +152,81 @@ type AssistantResponse = Exclude<ChatResponse, { type: "cook" }>;
 
 type ChatTurn =
   | { id: string; role: "user"; text: string }
-  | { id: string; role: "assistant"; response: AssistantResponse };
+  | { id: string; role: "assistant"; response: AssistantResponse; streaming?: boolean };
+
+/**
+ * Reads an SSE stream from POST /api/chat's "ask" branch and progressively
+ * updates the one turn it belongs to — "meta" fills in path/matches/savable
+ * as soon as it arrives, each "delta" appends to the answer text (so
+ * MarkdownMessage re-renders live token-by-token), "error" replaces the
+ * answer with a calm message, and "done"/stream-end clears the streaming
+ * flag. Malformed chunks are skipped rather than crashing the turn.
+ */
+async function consumeAskStream(
+  body: ReadableStream<Uint8Array>,
+  turnId: string,
+  setTurns: React.Dispatch<React.SetStateAction<ChatTurn[]>>
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+
+  function applyEvent(eventName: string, data: unknown) {
+    if (eventName === "meta") {
+      const meta = data as ChatStreamMeta;
+      setTurns((prev) =>
+        prev.map((t) => (t.id === turnId && t.role === "assistant" ? { ...t, response: { ...meta, answer } } : t))
+      );
+    } else if (eventName === "delta") {
+      answer += (data as { text: string }).text;
+      setTurns((prev) =>
+        prev.map((t) =>
+          t.id === turnId && t.role === "assistant" && t.response.type === "ask"
+            ? { ...t, response: { ...t.response, answer } }
+            : t
+        )
+      );
+    } else if (eventName === "error") {
+      const message = (data as { message: string }).message;
+      setTurns((prev) =>
+        prev.map((t) =>
+          t.id === turnId && t.role === "assistant" && t.response.type === "ask"
+            ? { ...t, response: { ...t.response, answer: message }, streaming: false }
+            : t
+        )
+      );
+    } else if (eventName === "done") {
+      setTurns((prev) => prev.map((t) => (t.id === turnId ? { ...t, streaming: false } : t)));
+    }
+  }
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let sepIndex: number;
+      while ((sepIndex = buffer.indexOf("\n\n")) >= 0) {
+        const rawEvent = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + 2);
+        const eventMatch = rawEvent.match(/^event: (.+)$/m);
+        const dataMatch = rawEvent.match(/^data: (.+)$/m);
+        if (!eventMatch || !dataMatch) continue;
+        try {
+          applyEvent(eventMatch[1], JSON.parse(dataMatch[1]));
+        } catch {
+          // Malformed chunk — skip it rather than crashing the stream.
+        }
+      }
+    }
+  } finally {
+    // Belt-and-suspenders: clear the streaming flag even if the connection
+    // dropped mid-flight without an explicit "done"/"error" event.
+    setTurns((prev) => prev.map((t) => (t.id === turnId ? { ...t, streaming: false } : t)));
+  }
+}
 
 export function ChatPanel({
   dish,
@@ -155,7 +238,7 @@ export function ChatPanel({
 }: {
   dish?: string;
   onLogged?: () => void;
-  onCookRecipe: (recipe: CookRecipe) => void;
+  onCookRecipe: (recipe: CookModeData) => void;
   placeholder: string;
   emptyTitle: string;
   emptyExample: string;
@@ -179,10 +262,32 @@ export function ChatPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(dish ? { message: text, dish } : { message: text }),
       });
+
+      // The ask-answer path streams as SSE; log/cook/pre-stream-error
+      // responses stay a single plain JSON body — detect which this is.
+      const contentType = res.headers.get("content-type") ?? "";
+      if (contentType.includes("text/event-stream") && res.body) {
+        const turnId = generateId();
+        setTurns((prev) => [
+          ...prev,
+          {
+            id: turnId,
+            role: "assistant",
+            response: { type: "ask", path: "RETRIEVE", answer: "", matches: [], savable: false },
+            streaming: true,
+          },
+        ]);
+        await consumeAskStream(res.body, turnId, setTurns);
+        return;
+      }
+
       const data: ChatResponse = await res.json();
 
       if (data.type === "cook") {
-        onCookRecipe(data.recipe);
+        // The dedicated cook-along backend flow returns a plain CookRecipe
+        // (no learnings field) — nothing to pin at the top of the drawer
+        // for this path.
+        onCookRecipe({ ...data.recipe, learnings: [] });
         return;
       }
 
@@ -237,8 +342,8 @@ export function ChatPanel({
   }
 
   return (
-    <div className="flex flex-1 flex-col">
-      <div className="flex-1 space-y-4 py-4">
+    <div className="flex min-w-0 flex-1 flex-col">
+      <div className="min-w-0 flex-1 space-y-4 py-4">
         {turns.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-hairline px-5 py-5">
             <p className="text-sm text-ink-muted">{emptyTitle}</p>
@@ -256,16 +361,21 @@ export function ChatPanel({
               <AssistantTurn
                 key={turn.id}
                 response={turn.response}
+                streaming={turn.streaming ?? false}
                 saving={savingId === turn.id}
                 saved={savedIds.has(turn.id)}
                 onSave={() =>
                   turn.response.type === "ask" && handleSaveGenerated(turn.id, turn.response.answer)
                 }
+                onCookRecipe={onCookRecipe}
               />
             )
           )
         )}
-        {pending && (
+        {/* Once a streaming turn is on screen, its growing text + cursor
+            (see AssistantTurn) IS the loading indicator — this generic one
+            only covers the round-trip before that turn exists yet. */}
+        {pending && !turns.some((t) => t.role === "assistant" && t.streaming) && (
           <div className="flex items-center gap-2 px-1 font-mono text-xs text-ink-muted">
             <span className="animate-pulse">●</span> thinking…
           </div>
@@ -299,14 +409,18 @@ export function ChatPanel({
 
 function AssistantTurn({
   response,
+  streaming,
   saving,
   saved,
   onSave,
+  onCookRecipe,
 }: {
   response: AssistantResponse;
+  streaming: boolean;
   saving: boolean;
   saved: boolean;
   onSave: () => void;
+  onCookRecipe: (recipe: CookModeData) => void;
 }) {
   if (response.type === "log") {
     if (response.saved && response.attempt) {
@@ -315,22 +429,55 @@ function AssistantTurn({
     return <p className="px-1 text-sm italic text-ink-muted">{response.reply}</p>;
   }
 
-  // response.type === "ask"
-  return (
-    <div className="rounded-2xl border border-hairline bg-card px-6 py-6 shadow-lift">
-      <PathTag path={response.path} />
-      <p className="mt-4 text-lg leading-relaxed text-ink">{renderMarkdownLite(response.answer)}</p>
+  // response.type === "ask" — while streaming, re-parsing on every chunk is
+  // cheap (plain string scans) and lets "Let's cook this" appear the
+  // instant the step list finishes, not just once the whole answer lands.
+  const recipe = parseRecipeMarkdown(response.answer);
 
-      {response.savable && (
-        <button
-          type="button"
-          onClick={onSave}
-          disabled={saving || saved}
-          className="mt-5 rounded-xl bg-accent px-5 py-2.5 text-sm font-medium text-paper transition-opacity disabled:opacity-60"
-        >
-          {saved ? "Saved to log ✓" : saving ? "Saving…" : "Save to log"}
-        </button>
-      )}
+  return (
+    <div className="min-w-0 rounded-2xl border border-hairline bg-card px-6 py-6 shadow-lift">
+      <PathTag path={response.path} />
+      <div className="mt-4">
+        <MarkdownMessage content={response.answer} />
+        {streaming && (
+          <span
+            aria-hidden
+            className="ml-0.5 inline-block h-4 w-[2px] translate-y-0.5 animate-pulse bg-accent align-middle"
+          />
+        )}
+      </div>
+
+      <div className="mt-5 flex flex-wrap items-center gap-3">
+        {response.savable && (
+          <button
+            type="button"
+            onClick={onSave}
+            disabled={saving || saved}
+            className="rounded-xl bg-accent px-5 py-2.5 text-sm font-medium text-paper transition-opacity disabled:opacity-60"
+          >
+            {saved ? "Saved to log ✓" : saving ? "Saving…" : "Save to log"}
+          </button>
+        )}
+
+        {!streaming && recipe && (
+          <button
+            type="button"
+            onClick={() => onCookRecipe(recipe)}
+            className="inline-flex items-center gap-2 rounded-xl border border-hairline bg-paper px-5 py-2.5 text-sm font-medium text-ink transition-colors hover:border-accent hover:text-accent"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+              <path
+                d="M12 3c1.5 2 1.5 3.5 0 5-1.5 1.5-1.5 3 0 4.5m-4-7c1.2 1.6 1.2 2.8 0 4-1.2 1.2-1.2 2.4 0 3.6M6 21c0-5 2.5-7 6-7s6 2 6 7"
+                stroke="currentColor"
+                strokeWidth={1.6}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            Let&apos;s cook this
+          </button>
+        )}
+      </div>
 
       <SourcesStrip matches={response.matches} />
     </div>
@@ -338,16 +485,50 @@ function AssistantTurn({
 }
 
 // ---------------------------------------------------------------------------
-// Cook mode — a full-screen takeover, not another card in the feed.
+// Cook mode — a right-side drawer alongside the chat (mobile: a full-screen
+// overlay instead, via responsive classes below), not a separate page.
+// Resizable/collapsible/closable on desktop; the chat stays usable while
+// it's open since it's a flex sibling, not something that replaces the page.
 // ---------------------------------------------------------------------------
 
 type CookStepState = { text: string; minutes: number | null; done: boolean };
 
-export function CookModeScreen({ recipe, onExit }: { recipe: CookRecipe; onExit: () => void }) {
+const DRAWER_MIN_WIDTH = 360;
+const DRAWER_MAX_WIDTH = 640;
+const DRAWER_DEFAULT_WIDTH = 440;
+
+/** Drag-to-resize the drawer's width from its left edge (desktop only — mobile is always full-width). */
+function useDrawerWidth() {
+  const [width, setWidth] = useState(DRAWER_DEFAULT_WIDTH);
+  const draggingRef = useRef(false);
+
+  useEffect(() => {
+    function onMouseMove(e: MouseEvent) {
+      if (!draggingRef.current) return;
+      const next = window.innerWidth - e.clientX;
+      setWidth(Math.min(DRAWER_MAX_WIDTH, Math.max(DRAWER_MIN_WIDTH, next)));
+    }
+    function onMouseUp() {
+      draggingRef.current = false;
+    }
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, []);
+
+  return { width, startResize: () => (draggingRef.current = true) };
+}
+
+export function CookDrawer({ recipe, onExit }: { recipe: CookModeData; onExit: () => void }) {
   const [steps, setSteps] = useState<CookStepState[]>(() =>
     recipe.steps.map((s) => ({ ...s, done: false }))
   );
   const [checkedIngredients, setCheckedIngredients] = useState<Set<number>>(new Set());
+  const [collapsed, setCollapsed] = useState(false);
+  const { width, startResize } = useDrawerWidth();
 
   function toggleStep(index: number) {
     setSteps((prev) => prev.map((s, i) => (i === index ? { ...s, done: !s.done } : s)));
@@ -364,13 +545,48 @@ export function CookModeScreen({ recipe, onExit }: { recipe: CookRecipe; onExit:
 
   const doneCount = steps.filter((s) => s.done).length;
 
+  // Collapsed: a slim rail, not fully closed — checklist/timer state is
+  // preserved (nothing unmounts), just tucked out of the way. Desktop only;
+  // the toggle that reaches this state is itself desktop-only (see below).
+  if (collapsed) {
+    return (
+      <div className="hidden shrink-0 flex-col items-center gap-4 border-l border-hairline bg-card py-4 sm:flex sm:w-12">
+        <button
+          type="button"
+          onClick={() => setCollapsed(false)}
+          aria-label="Expand cook mode"
+          className="flex h-9 w-9 items-center justify-center rounded-full border border-hairline text-ink-muted hover:text-accent"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+            <path d="M9 5l7 7-7 7" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+        <span className="origin-center rotate-90 whitespace-nowrap font-mono text-[11px] uppercase tracking-wide text-ink-faint">
+          {recipe.dish}
+        </span>
+      </div>
+    );
+  }
+
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-paper">
+    <div
+      className="fixed inset-0 z-50 flex w-full flex-col border-hairline bg-paper sm:static sm:inset-auto sm:z-auto sm:h-full sm:w-[var(--cook-drawer-width)] sm:shrink-0 sm:border-l sm:shadow-lift"
+      style={{ "--cook-drawer-width": `${width}px` } as React.CSSProperties}
+    >
+      {/* Resize handle — desktop only, drags the left edge. */}
+      <div
+        onMouseDown={(e) => {
+          e.preventDefault();
+          startResize();
+        }}
+        className="absolute inset-y-0 left-0 z-10 hidden w-1.5 -translate-x-1/2 cursor-col-resize sm:block hover:bg-accent/30"
+      />
+
       <div className="flex items-center gap-3 border-b border-hairline px-4 pt-[calc(env(safe-area-inset-top)+0.75rem)] pb-3 sm:pt-4">
         <button
           type="button"
           onClick={onExit}
-          aria-label="Exit cook mode"
+          aria-label="Close cook mode"
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-hairline bg-card text-ink-muted shadow-card hover:text-accent"
         >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -386,10 +602,35 @@ export function CookModeScreen({ recipe, onExit }: { recipe: CookRecipe; onExit:
         <span className="ml-auto shrink-0 font-mono text-xs text-ink-muted">
           {doneCount}/{steps.length} steps
         </span>
+        <button
+          type="button"
+          onClick={() => setCollapsed(true)}
+          aria-label="Collapse cook mode"
+          className="hidden h-9 w-9 shrink-0 items-center justify-center rounded-full border border-hairline text-ink-muted hover:text-accent sm:flex"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+            <path d="M15 5l-7 7 7 7" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-2xl px-4 py-5">
+          {recipe.learnings.length > 0 && (
+            <div className="sticky top-0 z-10 mb-6 rounded-2xl border-l-[3px] border-accent bg-accent-soft px-5 py-4 shadow-card">
+              <h2 className="font-mono text-[11px] uppercase tracking-wide text-accent">
+                Your key learnings
+              </h2>
+              <ul className="mt-2 space-y-1.5">
+                {recipe.learnings.map((learning, i) => (
+                  <li key={i} className="text-sm leading-relaxed text-ink">
+                    {learning}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {recipe.ingredients && recipe.ingredients.length > 0 && (
             <div className="mb-6 rounded-2xl border border-hairline bg-card px-5 py-4 shadow-card">
               <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">

@@ -85,6 +85,91 @@ export async function chat(
   return content;
 }
 
+/**
+ * Streaming chat call: same request shape as chat(), but stream:true.
+ * Ollama streams newline-delimited JSON objects, each carrying one
+ * message.content chunk; yields each chunk as it arrives so the caller can
+ * forward tokens to the client as they generate instead of waiting for the
+ * full reply. Only used for the final prose answer generation — never for
+ * JSON-expecting calls (classification/parsing), which stay one-shot.
+ */
+export async function* chatStream(
+  model: string,
+  system: string,
+  user: string,
+  opts: ChatOpts = {}
+): AsyncGenerator<string, void, unknown> {
+  const hasOptions = opts.temperature !== undefined || opts.maxTokens !== undefined;
+
+  let res: Response;
+  try {
+    res = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        stream: true,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        ...(opts.think !== undefined && { think: opts.think }),
+        ...(hasOptions && {
+          options: {
+            ...(opts.temperature !== undefined && { temperature: opts.temperature }),
+            ...(opts.maxTokens !== undefined && { num_predict: opts.maxTokens }),
+          },
+        }),
+      }),
+    });
+  } catch (err) {
+    throw new OllamaUnavailableError(
+      `Couldn't reach Ollama at ${OLLAMA_URL} (model=${model}): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  if (!res.ok || !res.body) {
+    const body = res.body ? await res.text() : "no response body";
+    throw new Error(`Ollama chat stream request failed (model=${model}, ${res.status}): ${body}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let gotAnyContent = false;
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let newlineIndex: number;
+      while ((newlineIndex = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (!line) continue;
+
+        const parsed = JSON.parse(line) as {
+          message?: { content?: string };
+          done?: boolean;
+          error?: string;
+        };
+        if (parsed.error) throw new Error(`Ollama chat stream error (model=${model}): ${parsed.error}`);
+        if (parsed.message?.content) {
+          gotAnyContent = true;
+          yield parsed.message.content;
+        }
+        if (parsed.done) return;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!gotAnyContent) throw new Error(`Ollama returned an empty chat stream (model=${model})`);
+}
+
 /** L2-normalizes a vector to unit length. */
 function l2Normalize(values: number[]): number[] {
   const magnitude = Math.sqrt(values.reduce((sum, v) => sum + v * v, 0));
