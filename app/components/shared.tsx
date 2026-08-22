@@ -561,7 +561,10 @@ export function CookDrawer({ recipe, onExit }: { recipe: CookModeData; onExit: (
             <path d="M9 5l7 7-7 7" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         </button>
-        <span className="origin-center rotate-90 whitespace-nowrap font-mono text-[11px] uppercase tracking-wide text-ink-faint">
+        {/* Decorative only — pointer-events-none so the rotated box (CSS
+            transforms don't reflow layout) can't shadow-click the expand
+            button above it; confirmed this was happening without it. */}
+        <span className="pointer-events-none origin-center rotate-90 whitespace-nowrap font-mono text-[11px] uppercase tracking-wide text-ink-faint">
           {recipe.dish}
         </span>
       </div>
