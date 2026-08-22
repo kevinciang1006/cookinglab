@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { Attempt, AttemptMatch, AskPath } from "@/lib/cooking";
-import type { ChatResponse, ChatPhase, ChatStreamEvent } from "@/app/api/chat/route";
+import type { ChatResponse, ChatPhase, ChatStreamEvent, ChatStreamMeta } from "@/app/api/chat/route";
 import { generateId } from "@/lib/id";
 import { MarkdownMessage } from "@/app/components/MarkdownMessage";
 import { parseRecipeMarkdown, type ParsedRecipe } from "@/lib/parseRecipeMarkdown";
@@ -169,6 +169,11 @@ type ChatTurn =
 // stall/hang, not normal slowness.
 const STREAM_STALL_MS = 45_000;
 
+// Fallback if a "token" somehow arrives with no cached "meta" (shouldn't
+// happen — the server always emits meta before the first token — but this
+// keeps the turn renderable instead of throwing if it ever does).
+const DEFAULT_ASK_META: ChatStreamMeta = { type: "ask", path: "RETRIEVE", matches: [], savable: false };
+
 /**
  * Reads the unified SSE stream from POST /api/chat and progressively
  * updates the one turn it belongs to: "status" sets the loading pill's
@@ -191,26 +196,29 @@ async function consumeChatStream(
   const decoder = new TextDecoder();
   let buffer = "";
   let answer = "";
+  // "meta" arrives before the model has actually produced anything —
+  // cached here rather than applied to the turn immediately, so the status
+  // pill (not an empty answer card with just a path tag and no text) stays
+  // on screen until the first token actually lands.
+  let pendingMeta: ChatStreamMeta | null = null;
+  let firstTokenSeen = false;
 
   function apply(event: ChatStreamEvent) {
     if (event.type === "status") {
       setTurns((prev) => prev.map((t) => (t.id === turnId && t.role === "assistant" ? { ...t, phase: event.phase } : t)));
     } else if (event.type === "meta") {
-      setTurns((prev) =>
-        prev.map((t) =>
-          t.id === turnId && t.role === "assistant"
-            ? { ...t, phase: null, response: { ...event.meta, answer } }
-            : t
-        )
-      );
+      pendingMeta = event.meta;
     } else if (event.type === "token") {
       answer += event.text;
       setTurns((prev) =>
-        prev.map((t) =>
-          t.id === turnId && t.role === "assistant" && t.response?.type === "ask"
-            ? { ...t, phase: null, response: { ...t.response, answer } }
-            : t
-        )
+        prev.map((t) => {
+          if (t.id !== turnId || t.role !== "assistant") return t;
+          if (!firstTokenSeen) {
+            firstTokenSeen = true;
+            return { ...t, phase: null, response: { ...(pendingMeta ?? DEFAULT_ASK_META), answer } };
+          }
+          return t.response?.type === "ask" ? { ...t, response: { ...t.response, answer } } : t;
+        })
       );
     } else if (event.type === "result") {
       const response = event.response;
