@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import type { Attempt, AttemptMatch, AskPath, CookRecipe } from "@/lib/cooking";
 import type { ChatResponse } from "@/app/api/chat/route";
+import { generateId } from "@/lib/id";
 
 // ---------------------------------------------------------------------------
 // Shared across the main Chat tab and dish detail pages (v1d): the chat
@@ -169,7 +170,7 @@ export function ChatPanel({
     const text = input.trim();
     if (!text || pending) return;
 
-    setTurns((prev) => [...prev, { id: crypto.randomUUID(), role: "user", text }]);
+    setTurns((prev) => [...prev, { id: generateId(), role: "user", text }]);
     setInput("");
     setPending(true);
     try {
@@ -185,7 +186,7 @@ export function ChatPanel({
         return;
       }
 
-      setTurns((prev) => [...prev, { id: crypto.randomUUID(), role: "assistant", response: data }]);
+      setTurns((prev) => [...prev, { id: generateId(), role: "assistant", response: data }]);
       if (data.type === "log" && data.saved) {
         onLogged?.();
       }
@@ -193,7 +194,7 @@ export function ChatPanel({
       setTurns((prev) => [
         ...prev,
         {
-          id: crypto.randomUUID(),
+          id: generateId(),
           role: "assistant",
           response: {
             type: "ask",
