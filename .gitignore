@@ -39,3 +39,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local cooking-log data (one-off import scratch files, not app source)
+/parsed.json
+/journey.txt
+/knowledge.txt
+
+# local Claude Code session state
+/.claude/

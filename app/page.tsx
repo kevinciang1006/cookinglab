@@ -1,69 +1,493 @@
-import Image from "next/image";
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import type { Attempt, AttemptKind, CookRecipe } from "@/lib/cooking";
+import { ChatPanel, CookModeScreen, RatingChip } from "@/app/components/shared";
+
+type TabId = "chat" | "recent";
+
+const TABS: { id: TabId; label: string }[] = [
+  { id: "chat", label: "Chat" },
+  { id: "recent", label: "Recent" },
+];
+
+const TAB_TITLES: Record<TabId, string> = {
+  chat: "Cooking Lab",
+  recent: "Recent cooks",
+};
+
+type EditDraft = {
+  dish: string;
+  changes: string;
+  outcome: string;
+  analysis: string;
+  target: string;
+  rating: string;
+  kind: AttemptKind;
+};
+
+// ---------------------------------------------------------------------------
+// Home — owns Recent's state/handlers and the cook-mode takeover. Chat
+// itself (Log + Ask merged, v1d) is the shared <ChatPanel />; it owns its
+// own conversation state.
+// ---------------------------------------------------------------------------
 
 export default function Home() {
+  const [activeTab, setActiveTab] = useState<TabId>("chat");
+  const [cookRecipe, setCookRecipe] = useState<CookRecipe | null>(null);
+
+  const [recent, setRecent] = useState<Attempt[]>([]);
+  const [recentLoading, setRecentLoading] = useState(true);
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  async function refreshRecent() {
+    try {
+      const res = await fetch("/api/attempts");
+      if (res.ok) setRecent(await res.json());
+    } finally {
+      setRecentLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshRecent();
+  }, []);
+
+  function startEdit(attempt: Attempt) {
+    setEditingId(attempt.id);
+    setEditDraft({
+      dish: attempt.dish,
+      changes: attempt.changes ?? "",
+      outcome: attempt.outcome ?? "",
+      analysis: attempt.analysis ?? "",
+      target: attempt.target ?? "",
+      rating: attempt.rating != null ? String(attempt.rating) : "",
+      kind: attempt.kind,
+    });
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditDraft(null);
+  }
+
+  async function saveEdit(id: string) {
+    if (!editDraft || editSaving) return;
+    setEditSaving(true);
+    try {
+      const rating = editDraft.rating.trim() === "" ? null : Number(editDraft.rating);
+      const res = await fetch(`/api/attempts/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dish: editDraft.dish.trim(),
+          changes: editDraft.changes.trim() || null,
+          outcome: editDraft.outcome.trim() || null,
+          analysis: editDraft.analysis.trim() || null,
+          target: editDraft.target.trim() || null,
+          rating,
+          kind: editDraft.kind,
+        }),
+      });
+      if (res.ok) {
+        cancelEdit();
+        await refreshRecent();
+      }
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
+  async function handleDelete(id: string) {
+    if (!confirm("Delete this attempt? This can't be undone.")) return;
+    setDeletingId(id);
+    try {
+      await fetch(`/api/attempts/${id}`, { method: "DELETE" });
+      if (editingId === id) cancelEdit();
+      await refreshRecent();
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  // Cook-mode takes over the whole view — a different mode, not a card in
+  // the feed. Short-circuit the entire tabbed shell while it's active.
+  if (cookRecipe) {
+    return <CookModeScreen recipe={cookRecipe} onExit={() => setCookRecipe(null)} />;
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
+    <div className="flex h-dvh flex-col bg-paper">
+      <header className="mx-auto w-full max-w-2xl px-4 pt-4 pb-2 sm:pt-8 sm:pb-4">
+        <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-ink-faint">
+          Cooking Lab
+        </p>
+        <h1 className="mt-0.5 text-xl font-semibold tracking-tight text-ink sm:text-2xl">
+          {TAB_TITLES[activeTab]}
+        </h1>
+      </header>
+
+      <nav className="mx-auto hidden w-full max-w-2xl px-4 pb-4 sm:block">
+        <TabBar activeTab={activeTab} onChange={setActiveTab} />
+      </nav>
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto flex w-full max-w-2xl flex-col px-4 pb-28 sm:pb-10">
+          {activeTab === "chat" && (
+            <ChatPanel
+              onLogged={refreshRecent}
+              onCookRecipe={setCookRecipe}
+              placeholder="Log a cook, or ask about your log…"
+              emptyTitle="Log a cook, or ask about your log — try either:"
+              emptyExample="siobak attempt 4, oven 180 last 10 min, crackling worked, 8/10"
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+          )}
+
+          {activeTab === "recent" && (
+            <RecentTab
+              recent={recent}
+              loading={recentLoading}
+              editingId={editingId}
+              editDraft={editDraft}
+              editSaving={editSaving}
+              deletingId={deletingId}
+              onEdit={startEdit}
+              onCancelEdit={cancelEdit}
+              onSaveEdit={saveEdit}
+              onChangeDraft={setEditDraft}
+              onDelete={handleDelete}
+            />
+          )}
         </div>
-      </main>
+      </div>
+
+      <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-hairline bg-card/95 pb-[env(safe-area-inset-bottom)] backdrop-blur sm:hidden">
+        <TabBar activeTab={activeTab} onChange={setActiveTab} variant="bottom" />
+      </nav>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tab navigation
+// ---------------------------------------------------------------------------
+
+function TabBar({
+  activeTab,
+  onChange,
+  variant = "top",
+}: {
+  activeTab: TabId;
+  onChange: (tab: TabId) => void;
+  variant?: "top" | "bottom";
+}) {
+  if (variant === "bottom") {
+    return (
+      <div className="mx-auto flex w-full max-w-2xl items-stretch justify-around">
+        {TABS.map((tab) => {
+          const active = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => onChange(tab.id)}
+              className={`flex flex-1 flex-col items-center gap-1 py-2.5 text-xs font-medium transition-colors ${
+                active ? "text-accent" : "text-ink-faint"
+              }`}
+            >
+              <TabIcon tab={tab.id} active={active} />
+              {tab.label}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
+  return (
+    <div className="inline-flex gap-1 rounded-full border border-hairline bg-card p-1 shadow-card">
+      {TABS.map((tab) => {
+        const active = activeTab === tab.id;
+        return (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => onChange(tab.id)}
+            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+              active ? "bg-accent text-paper" : "text-ink-muted hover:text-ink"
+            }`}
+          >
+            {tab.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function TabIcon({ tab, active }: { tab: TabId; active: boolean }) {
+  const stroke = active ? "var(--accent)" : "var(--ink-faint)";
+  const common = { width: 22, height: 22, viewBox: "0 0 24 24", fill: "none" as const };
+
+  if (tab === "chat") {
+    return (
+      <svg {...common} aria-hidden>
+        <path
+          d="M12 3.5v3M12 17.5v3M20.5 12h-3M6.5 12h-3M17.5 6.5l-2 2M8.5 15.5l-2 2M17.5 17.5l-2-2M8.5 8.5l-2-2"
+          stroke={stroke}
+          strokeWidth={1.6}
+          strokeLinecap="round"
+        />
+      </svg>
+    );
+  }
+  return (
+    <svg {...common} aria-hidden>
+      <circle cx="12" cy="12" r="8" stroke={stroke} strokeWidth={1.6} />
+      <path d="M12 8v4.5l3 2" stroke={stroke} strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Recent tab — grouped by dish, card treatment with breathing room. Each
+// card navigates to /dish/[name]; edit/delete stop that propagation.
+// ---------------------------------------------------------------------------
+
+type DishGroup = { dish: string; attempts: Attempt[] };
+
+function groupByDish(attempts: Attempt[]): DishGroup[] {
+  const order: string[] = [];
+  const map = new Map<string, Attempt[]>();
+  for (const a of attempts) {
+    if (!map.has(a.dish)) {
+      map.set(a.dish, []);
+      order.push(a.dish);
+    }
+    map.get(a.dish)!.push(a);
+  }
+  return order.map((dish) => ({ dish, attempts: map.get(dish)! }));
+}
+
+function RecentTab({
+  recent,
+  loading,
+  editingId,
+  editDraft,
+  editSaving,
+  deletingId,
+  onEdit,
+  onCancelEdit,
+  onSaveEdit,
+  onChangeDraft,
+  onDelete,
+}: {
+  recent: Attempt[];
+  loading: boolean;
+  editingId: string | null;
+  editDraft: EditDraft | null;
+  editSaving: boolean;
+  deletingId: string | null;
+  onEdit: (attempt: Attempt) => void;
+  onCancelEdit: () => void;
+  onSaveEdit: (id: string) => void;
+  onChangeDraft: (draft: EditDraft) => void;
+  onDelete: (id: string) => void;
+}) {
+  const router = useRouter();
+  const groups = useMemo(() => groupByDish(recent), [recent]);
+
+  if (loading) {
+    return <p className="py-8 text-center text-sm text-ink-muted">Loading…</p>;
+  }
+
+  if (recent.length === 0) {
+    return (
+      <div className="mt-4 rounded-2xl border border-dashed border-hairline px-5 py-8 text-center">
+        <p className="text-sm text-ink-muted">Nothing logged yet — your first cook will show up here.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4 py-4">
+      {groups.map((group) => (
+        <div
+          key={group.dish}
+          role="link"
+          tabIndex={0}
+          onClick={() => router.push(`/dish/${encodeURIComponent(group.dish)}`)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") router.push(`/dish/${encodeURIComponent(group.dish)}`);
+          }}
+          className="cursor-pointer overflow-hidden rounded-2xl border border-hairline bg-card shadow-card transition-shadow hover:shadow-lift"
+        >
+          <div className="flex items-baseline gap-2 border-b border-hairline px-4 py-3">
+            <h3 className="font-mono text-base font-medium text-ink">{group.dish}</h3>
+            {group.attempts.length > 1 && (
+              <span className="font-mono text-xs text-ink-faint">×{group.attempts.length}</span>
+            )}
+          </div>
+          <div className="divide-y divide-hairline">
+            {group.attempts.map((attempt) =>
+              editingId === attempt.id && editDraft ? (
+                <div key={attempt.id} className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                  <EditRow
+                    draft={editDraft}
+                    saving={editSaving}
+                    onChange={onChangeDraft}
+                    onSave={() => onSaveEdit(attempt.id)}
+                    onCancel={onCancelEdit}
+                  />
+                </div>
+              ) : (
+                <RecentEntryRow
+                  key={attempt.id}
+                  attempt={attempt}
+                  deleting={deletingId === attempt.id}
+                  onEdit={() => onEdit(attempt)}
+                  onDelete={() => onDelete(attempt.id)}
+                />
+              )
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RecentEntryRow({
+  attempt,
+  deleting,
+  onEdit,
+  onDelete,
+}: {
+  attempt: Attempt;
+  deleting: boolean;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="group flex items-start justify-between gap-3 px-4 py-3">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <RatingChip rating={attempt.rating} />
+          {(attempt.changes || attempt.outcome) && (
+            <p className="truncate text-sm text-ink">
+              {[attempt.changes, attempt.outcome].filter(Boolean).join(" · ")}
+            </p>
+          )}
+        </div>
+        {attempt.analysis && (
+          <p className="mt-1 truncate text-sm italic text-ink-muted">{attempt.analysis}</p>
+        )}
+      </div>
+      <div className="flex shrink-0 items-center gap-2 pt-0.5 text-ink-faint opacity-70 transition-opacity group-hover:text-ink-muted group-hover:opacity-100">
+        <span className="font-mono text-[11px]">{attempt.cooked_at}</span>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onEdit();
+          }}
+          className="font-mono text-[11px] underline decoration-dotted underline-offset-2 hover:text-accent"
+        >
+          edit
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          disabled={deleting}
+          className="font-mono text-[11px] underline decoration-dotted underline-offset-2 hover:text-accent disabled:opacity-50"
+        >
+          {deleting ? "…" : "delete"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function EditRow({
+  draft,
+  saving,
+  onChange,
+  onSave,
+  onCancel,
+}: {
+  draft: EditDraft;
+  saving: boolean;
+  onChange: (draft: EditDraft) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  function set<K extends keyof EditDraft>(key: K, value: EditDraft[K]) {
+    onChange({ ...draft, [key]: value });
+  }
+
+  const fieldClass =
+    "w-full rounded-lg border border-hairline bg-paper px-2.5 py-1.5 text-sm text-ink focus:outline-none focus:ring-1 focus:ring-accent";
+  const labelClass = "font-mono text-[11px] uppercase tracking-wide text-ink-faint";
+
+  return (
+    <div>
+      <div className="grid grid-cols-[5rem_1fr] items-center gap-x-3 gap-y-2">
+        <label className={labelClass}>dish</label>
+        <input value={draft.dish} onChange={(e) => set("dish", e.target.value)} className={fieldClass} />
+        <label className={labelClass}>changes</label>
+        <input value={draft.changes} onChange={(e) => set("changes", e.target.value)} className={fieldClass} />
+        <label className={labelClass}>outcome</label>
+        <input value={draft.outcome} onChange={(e) => set("outcome", e.target.value)} className={fieldClass} />
+        <label className={labelClass}>analysis</label>
+        <textarea
+          value={draft.analysis}
+          onChange={(e) => set("analysis", e.target.value)}
+          rows={2}
+          className={`${fieldClass} resize-none`}
+        />
+        <label className={labelClass}>target</label>
+        <input value={draft.target} onChange={(e) => set("target", e.target.value)} className={fieldClass} />
+        <label className={labelClass}>rating</label>
+        <input
+          value={draft.rating}
+          onChange={(e) => set("rating", e.target.value)}
+          inputMode="numeric"
+          placeholder="1-10"
+          className={fieldClass}
+        />
+        <label className={labelClass}>kind</label>
+        <select value={draft.kind} onChange={(e) => set("kind", e.target.value as AttemptKind)} className={fieldClass}>
+          <option value="attempt">attempt</option>
+          <option value="experiment">experiment</option>
+          <option value="note">note</option>
+        </select>
+      </div>
+      <div className="mt-3 flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={saving}
+          className="rounded-lg border border-hairline px-3 py-1.5 text-xs font-medium text-ink-muted disabled:opacity-50"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={saving || !draft.dish.trim()}
+          className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-paper disabled:opacity-40"
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
     </div>
   );
 }
