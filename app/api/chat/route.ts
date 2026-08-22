@@ -27,8 +27,21 @@ export type ChatResponse =
   | { type: "ask"; path: AskPath; answer: string; matches: AttemptMatch[]; savable: boolean };
 
 // Everything about an "ask" response except the answer text itself — sent
-// as the first SSE event, before the answer starts streaming in behind it.
+// as a "meta" event, before the answer starts streaming in behind it.
 export type ChatStreamMeta = Omit<Extract<ChatResponse, { type: "ask" }>, "answer">;
+
+/** Progress markers sent before/between the silent pre-generation steps (classify, embed+search, model call) so the client never sits on dead air. */
+export type ChatPhase = "classifying" | "searching" | "thinking" | "logging";
+
+// The whole POST /api/chat response is one of these lines, uniformly, for
+// every outcome (log, cook, ask) — not just the token-streamed answer.
+export type ChatStreamEvent =
+  | { type: "status"; phase: ChatPhase }
+  | { type: "meta"; meta: ChatStreamMeta }
+  | { type: "token"; text: string }
+  | { type: "result"; response: ChatResponse }
+  | { type: "error"; message: string }
+  | { type: "done" };
 
 const MATCH_COUNT = 8;
 
@@ -41,36 +54,30 @@ function askError(answer: string): ChatResponse {
   return { type: "ask", path: "RETRIEVE", answer, matches: [], savable: false };
 }
 
-function sseEvent(event: string, data: unknown): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
 /**
- * Streams a prose answer as Server-Sent Events: a "meta" event with
- * everything but the answer text, then one "delta" event per chunk as the
- * model generates, then "done" — or an "error" event in place of "done" if
- * the model call fails mid-stream (headers are already committed 200 by
- * the time streaming starts, so a failure can't become an HTTP error status
- * — the client treats an "error" event as the terminal state instead).
- * Only the final prose answer generation streams; intent classification and
- * retrieval already ran (synchronously, above) before this is called.
+ * Wraps the whole classify → retrieve → generate pipeline in one SSE
+ * response. `run` emits status/meta/token/result events as each phase
+ * happens — including status events for the silent pre-generation steps
+ * (classifying, searching) that used to leave the client with no signal at
+ * all until the answer was already fully ready. "done" is appended
+ * automatically once `run` resolves, unless it already emitted "error"
+ * (headers are committed 200 by the time streaming starts, so a failure
+ * can't become an HTTP error status — the client treats "error" as terminal
+ * instead of waiting for "done").
  */
-function streamAskResponse(meta: ChatStreamMeta, chunks: AsyncGenerator<string, void, unknown>): Response {
+function streamChat(run: (emit: (event: ChatStreamEvent) => void) => Promise<void>): Response {
   const encoder = new TextEncoder();
+  let errored = false;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      controller.enqueue(encoder.encode(sseEvent("meta", meta)));
+      function emit(event: ChatStreamEvent) {
+        if (event.type === "error") errored = true;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      }
       try {
-        for await (const chunk of chunks) {
-          controller.enqueue(encoder.encode(sseEvent("delta", { text: chunk })));
-        }
-        controller.enqueue(encoder.encode(sseEvent("done", {})));
-      } catch (err) {
-        console.error("chat answer stream failed:", err);
-        const message =
-          err instanceof OllamaUnavailableError ? UNAVAILABLE_MESSAGE : "Couldn't answer that — try again in a bit.";
-        controller.enqueue(encoder.encode(sseEvent("error", { message })));
+        await run(emit);
       } finally {
+        if (!errored) emit({ type: "done" });
         controller.close();
       }
     },
@@ -125,100 +132,123 @@ export async function POST(request: Request) {
     ? `[Context: this conversation is about "${dishFilter}"] ${trimmed}`
     : trimmed;
 
-  try {
-    const intent = await classifyChatIntent(contextualMessage);
+  return streamChat(async (emit) => {
+    try {
+      emit({ type: "status", phase: "classifying" });
+      const intent = await classifyChatIntent(contextualMessage);
 
-    if (intent === "LOG") {
-      const forParser = dishFilter ? `Regarding ${dishFilter}: ${trimmed}` : trimmed;
+      if (intent === "LOG") {
+        emit({ type: "status", phase: "logging" });
+        const forParser = dishFilter ? `Regarding ${dishFilter}: ${trimmed}` : trimmed;
 
-      let parsed;
-      try {
-        parsed = await parseLog(forParser);
-      } catch (err) {
-        console.error("chat parseLog failed:", err);
-        return NextResponse.json<ChatResponse>({
-          type: "log",
-          saved: false,
-          reply: err instanceof OllamaUnavailableError ? UNAVAILABLE_MESSAGE : "Couldn't parse that one — mind rephrasing it?",
-        });
+        let parsed;
+        try {
+          parsed = await parseLog(forParser);
+        } catch (err) {
+          console.error("chat parseLog failed:", err);
+          emit({
+            type: "result",
+            response: {
+              type: "log",
+              saved: false,
+              reply:
+                err instanceof OllamaUnavailableError
+                  ? UNAVAILABLE_MESSAGE
+                  : "Couldn't parse that one — mind rephrasing it?",
+            },
+          });
+          return;
+        }
+
+        const effectiveDish = dishFilter ?? parsed.dish;
+        if (parsed.skip || !effectiveDish) {
+          emit({
+            type: "result",
+            response: { type: "log", saved: false, reply: "Doesn't look like a cook — nothing saved." },
+          });
+          return;
+        }
+
+        try {
+          const attempt = await insertAttempt(trimmed, {
+            dish: effectiveDish,
+            changes: parsed.changes,
+            outcome: parsed.outcome,
+            analysis: parsed.analysis,
+            rating: parsed.rating,
+          });
+
+          // Refresh this dish's cached "memory" summary after the response
+          // is sent — Vercel-safe background work, doesn't add latency here.
+          after(() => regenerateDishMemory(effectiveDish).catch((err) => {
+            console.error("regenerateDishMemory failed:", err);
+          }));
+
+          emit({ type: "result", response: { type: "log", saved: true, reply: "Logged.", attempt } });
+        } catch (err) {
+          console.error("chat insertAttempt failed:", err);
+          emit({
+            type: "result",
+            response: {
+              type: "log",
+              saved: false,
+              reply: "That parsed fine, but saving it failed — try again in a bit.",
+            },
+          });
+        }
+        return;
       }
 
-      const effectiveDish = dishFilter ?? parsed.dish;
-      if (parsed.skip || !effectiveDish) {
-        return NextResponse.json<ChatResponse>({
-          type: "log",
-          saved: false,
-          reply: "Doesn't look like a cook — nothing saved.",
-        });
+      // QUERY — mirrors the /api/ask agent, optionally scoped to one dish.
+      emit({ type: "status", phase: "searching" });
+      const queryEmbedding = await embed(trimmed, EMBED_MODEL);
+      const [candidates, cookAlong] = await Promise.all([
+        matchAttempts(queryEmbedding, MATCH_COUNT, dishFilter),
+        detectCookAlongIntent(contextualMessage),
+      ]);
+      const relevant = candidates.filter((m) => m.similarity >= RELEVANCE_THRESHOLD);
+
+      if (cookAlong) {
+        emit({ type: "status", phase: "thinking" });
+        const bestMatch = relevant.length > 0 ? relevant[0] : null;
+        const recipe = await synthesizeCookRecipe(contextualMessage, bestMatch);
+        emit({ type: "result", response: { type: "cook", recipe } });
+        return;
       }
 
-      try {
-        const attempt = await insertAttempt(trimmed, {
-          dish: effectiveDish,
-          changes: parsed.changes,
-          outcome: parsed.outcome,
-          analysis: parsed.analysis,
-          rating: parsed.rating,
-        });
+      const path: AskPath =
+        relevant.length === 0 ? "GENERATE" : await classifyAskIntent(contextualMessage, relevant);
 
-        // Refresh this dish's cached "memory" summary after the response is
-        // sent — Vercel-safe background work, doesn't add latency here.
-        after(() => regenerateDishMemory(effectiveDish).catch((err) => {
-          console.error("regenerateDishMemory failed:", err);
-        }));
+      emit({ type: "status", phase: "thinking" });
 
-        return NextResponse.json<ChatResponse>({ type: "log", saved: true, reply: "Logged.", attempt });
-      } catch (err) {
-        console.error("chat insertAttempt failed:", err);
-        return NextResponse.json<ChatResponse>({
-          type: "log",
-          saved: false,
-          reply: "That parsed fine, but saving it failed — try again in a bit.",
-        });
+      // From here on, only the prose answer itself streams — intent
+      // classification and retrieval already happened above.
+      if (path === "GENERATE") {
+        emit({ type: "meta", meta: { type: "ask", path: "GENERATE", matches: [], savable: true } });
+        for await (const chunk of synthesizeGeneratedStream(contextualMessage)) {
+          emit({ type: "token", text: chunk });
+        }
+        return;
       }
+
+      if (path === "ADAPT") {
+        emit({ type: "meta", meta: { type: "ask", path: "ADAPT", matches: relevant, savable: false } });
+        for await (const chunk of synthesizeAdaptationStream(contextualMessage, relevant)) {
+          emit({ type: "token", text: chunk });
+        }
+        return;
+      }
+
+      emit({ type: "meta", meta: { type: "ask", path: "RETRIEVE", matches: relevant, savable: false } });
+      for await (const chunk of synthesizeAnswerStream(contextualMessage, relevant)) {
+        emit({ type: "token", text: chunk });
+      }
+    } catch (err) {
+      console.error("chat failed:", err);
+      emit({
+        type: "error",
+        message: err instanceof OllamaUnavailableError ? UNAVAILABLE_MESSAGE : "Couldn't answer that — try again in a bit.",
+      });
     }
-
-    // QUERY — mirrors the /api/ask agent, optionally scoped to one dish.
-    const queryEmbedding = await embed(trimmed, EMBED_MODEL);
-    const [candidates, cookAlong] = await Promise.all([
-      matchAttempts(queryEmbedding, MATCH_COUNT, dishFilter),
-      detectCookAlongIntent(contextualMessage),
-    ]);
-    const relevant = candidates.filter((m) => m.similarity >= RELEVANCE_THRESHOLD);
-
-    if (cookAlong) {
-      const bestMatch = relevant.length > 0 ? relevant[0] : null;
-      const recipe = await synthesizeCookRecipe(contextualMessage, bestMatch);
-      return NextResponse.json<ChatResponse>({ type: "cook", recipe });
-    }
-
-    const path: AskPath =
-      relevant.length === 0 ? "GENERATE" : await classifyAskIntent(contextualMessage, relevant);
-
-    // From here on, only the prose answer itself streams — intent
-    // classification and retrieval already happened above.
-    if (path === "GENERATE") {
-      return streamAskResponse(
-        { type: "ask", path: "GENERATE", matches: [], savable: true },
-        synthesizeGeneratedStream(contextualMessage)
-      );
-    }
-
-    if (path === "ADAPT") {
-      return streamAskResponse(
-        { type: "ask", path: "ADAPT", matches: relevant, savable: false },
-        synthesizeAdaptationStream(contextualMessage, relevant)
-      );
-    }
-
-    return streamAskResponse(
-      { type: "ask", path: "RETRIEVE", matches: relevant, savable: false },
-      synthesizeAnswerStream(contextualMessage, relevant)
-    );
-  } catch (err) {
-    console.error("chat failed:", err);
-    return NextResponse.json<ChatResponse>(
-      askError(err instanceof OllamaUnavailableError ? UNAVAILABLE_MESSAGE : "Couldn't answer that — try again in a bit.")
-    );
-  }
+  });
 }

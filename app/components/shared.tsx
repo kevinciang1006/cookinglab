@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { Attempt, AttemptMatch, AskPath } from "@/lib/cooking";
-import type { ChatResponse, ChatStreamMeta } from "@/app/api/chat/route";
+import type { ChatResponse, ChatPhase, ChatStreamEvent } from "@/app/api/chat/route";
 import { generateId } from "@/lib/id";
 import { MarkdownMessage } from "@/app/components/MarkdownMessage";
 import { parseRecipeMarkdown, type ParsedRecipe } from "@/lib/parseRecipeMarkdown";
@@ -152,58 +152,113 @@ type AssistantResponse = Exclude<ChatResponse, { type: "cook" }>;
 
 type ChatTurn =
   | { id: string; role: "user"; text: string }
-  | { id: string; role: "assistant"; response: AssistantResponse; streaming?: boolean };
+  | {
+      id: string;
+      role: "assistant";
+      // null while waiting on a silent pre-generation step — the status
+      // pill (see StatusPill) renders instead of a response in that state.
+      response: AssistantResponse | null;
+      phase: ChatPhase | null;
+      streaming: boolean;
+    };
+
+// If the stream goes fully silent for this long (no event at all — not
+// even a status update), something's stuck server-side; give up rather
+// than spin forever. Generation, once it starts, sends chunks far more
+// often than this, so a real gap this long only happens on a genuine
+// stall/hang, not normal slowness.
+const STREAM_STALL_MS = 45_000;
 
 /**
- * Reads an SSE stream from POST /api/chat's "ask" branch and progressively
- * updates the one turn it belongs to — "meta" fills in path/matches/savable
- * as soon as it arrives, each "delta" appends to the answer text (so
- * MarkdownMessage re-renders live token-by-token), "error" replaces the
- * answer with a calm message, and "done"/stream-end clears the streaming
- * flag. Malformed chunks are skipped rather than crashing the turn.
+ * Reads the unified SSE stream from POST /api/chat and progressively
+ * updates the one turn it belongs to: "status" sets the loading pill's
+ * phase, "meta" fills in path/matches/savable the moment it arrives, each
+ * "token" appends to the answer text (MarkdownMessage re-renders live),
+ * "result" delivers a non-streamed outcome (log confirmation, or a cook
+ * recipe — which never becomes a turn, see onCookRecipe below), "error"
+ * replaces the pill/answer with a calm message, and "done"/stream-end/stall
+ * clears the streaming flag. Malformed chunks are skipped rather than
+ * crashing the turn.
  */
-async function consumeAskStream(
+async function consumeChatStream(
   body: ReadableStream<Uint8Array>,
   turnId: string,
-  setTurns: React.Dispatch<React.SetStateAction<ChatTurn[]>>
+  setTurns: React.Dispatch<React.SetStateAction<ChatTurn[]>>,
+  onCookRecipe: (recipe: CookModeData) => void,
+  onLogged: (() => void) | undefined
 ): Promise<void> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let answer = "";
 
-  function applyEvent(eventName: string, data: unknown) {
-    if (eventName === "meta") {
-      const meta = data as ChatStreamMeta;
-      setTurns((prev) =>
-        prev.map((t) => (t.id === turnId && t.role === "assistant" ? { ...t, response: { ...meta, answer } } : t))
-      );
-    } else if (eventName === "delta") {
-      answer += (data as { text: string }).text;
+  function apply(event: ChatStreamEvent) {
+    if (event.type === "status") {
+      setTurns((prev) => prev.map((t) => (t.id === turnId && t.role === "assistant" ? { ...t, phase: event.phase } : t)));
+    } else if (event.type === "meta") {
       setTurns((prev) =>
         prev.map((t) =>
-          t.id === turnId && t.role === "assistant" && t.response.type === "ask"
-            ? { ...t, response: { ...t.response, answer } }
+          t.id === turnId && t.role === "assistant"
+            ? { ...t, phase: null, response: { ...event.meta, answer } }
             : t
         )
       );
-    } else if (eventName === "error") {
-      const message = (data as { message: string }).message;
+    } else if (event.type === "token") {
+      answer += event.text;
       setTurns((prev) =>
         prev.map((t) =>
-          t.id === turnId && t.role === "assistant" && t.response.type === "ask"
-            ? { ...t, response: { ...t.response, answer: message }, streaming: false }
+          t.id === turnId && t.role === "assistant" && t.response?.type === "ask"
+            ? { ...t, phase: null, response: { ...t.response, answer } }
             : t
         )
       );
-    } else if (eventName === "done") {
+    } else if (event.type === "result") {
+      const response = event.response;
+      if (response.type === "cook") {
+        // Cook responses never become a turn — remove the placeholder pill
+        // turn and hand off to cook mode instead, same as the plain-JSON
+        // path below. No learnings field from this backend flow.
+        setTurns((prev) => prev.filter((t) => t.id !== turnId));
+        onCookRecipe({ ...response.recipe, learnings: [] });
+        return;
+      }
+      setTurns((prev) =>
+        prev.map((t) => (t.id === turnId && t.role === "assistant" ? { ...t, phase: null, response, streaming: false } : t))
+      );
+      if (response.type === "log" && response.saved) onLogged?.();
+    } else if (event.type === "error") {
+      setTurns((prev) =>
+        prev.map((t) => {
+          if (t.id !== turnId || t.role !== "assistant") return t;
+          const response: AssistantResponse =
+            t.response?.type === "ask"
+              ? { ...t.response, answer: event.message }
+              : { type: "ask", path: "RETRIEVE", answer: event.message, matches: [], savable: false };
+          return { ...t, phase: null, streaming: false, response };
+        })
+      );
+    } else if (event.type === "done") {
       setTurns((prev) => prev.map((t) => (t.id === turnId ? { ...t, streaming: false } : t)));
     }
   }
 
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  let stalled = false;
+  function resetWatchdog() {
+    if (watchdog) clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      stalled = true;
+      apply({ type: "error", message: "Taking too long — try again in a bit." });
+      reader.cancel().catch(() => {});
+    }, STREAM_STALL_MS);
+  }
+
   try {
+    resetWatchdog();
     while (true) {
       const { value, done } = await reader.read();
+      if (stalled) break;
+      resetWatchdog();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
@@ -211,17 +266,17 @@ async function consumeAskStream(
       while ((sepIndex = buffer.indexOf("\n\n")) >= 0) {
         const rawEvent = buffer.slice(0, sepIndex);
         buffer = buffer.slice(sepIndex + 2);
-        const eventMatch = rawEvent.match(/^event: (.+)$/m);
         const dataMatch = rawEvent.match(/^data: (.+)$/m);
-        if (!eventMatch || !dataMatch) continue;
+        if (!dataMatch) continue;
         try {
-          applyEvent(eventMatch[1], JSON.parse(dataMatch[1]));
+          apply(JSON.parse(dataMatch[1]) as ChatStreamEvent);
         } catch {
           // Malformed chunk — skip it rather than crashing the stream.
         }
       }
     }
   } finally {
+    if (watchdog) clearTimeout(watchdog);
     // Belt-and-suspenders: clear the streaming flag even if the connection
     // dropped mid-flight without an explicit "done"/"error" event.
     setTurns((prev) => prev.map((t) => (t.id === turnId ? { ...t, streaming: false } : t)));
@@ -263,21 +318,22 @@ export function ChatPanel({
         body: JSON.stringify(dish ? { message: text, dish } : { message: text }),
       });
 
-      // The ask-answer path streams as SSE; log/cook/pre-stream-error
-      // responses stay a single plain JSON body — detect which this is.
+      // Every real outcome streams now (status pills before/instead of
+      // dead air); only the earliest, pre-classification failures (bad
+      // request body, empty message) stay a single plain JSON response —
+      // detect which this is.
       const contentType = res.headers.get("content-type") ?? "";
       if (contentType.includes("text/event-stream") && res.body) {
         const turnId = generateId();
+        // Optimistic initial phase — the server's own first event is
+        // always "classifying" too, arriving a moment later; starting here
+        // means the pill is on screen the instant the turn exists, with no
+        // round-trip wait even for that first status update.
         setTurns((prev) => [
           ...prev,
-          {
-            id: turnId,
-            role: "assistant",
-            response: { type: "ask", path: "RETRIEVE", answer: "", matches: [], savable: false },
-            streaming: true,
-          },
+          { id: turnId, role: "assistant", response: null, phase: "classifying", streaming: true },
         ]);
-        await consumeAskStream(res.body, turnId, setTurns);
+        await consumeChatStream(res.body, turnId, setTurns, onCookRecipe, onLogged);
         return;
       }
 
@@ -291,7 +347,7 @@ export function ChatPanel({
         return;
       }
 
-      setTurns((prev) => [...prev, { id: generateId(), role: "assistant", response: data }]);
+      setTurns((prev) => [...prev, { id: generateId(), role: "assistant", response: data, phase: null, streaming: false }]);
       if (data.type === "log" && data.saved) {
         onLogged?.();
       }
@@ -301,6 +357,8 @@ export function ChatPanel({
         {
           id: generateId(),
           role: "assistant",
+          phase: null,
+          streaming: false,
           response: {
             type: "ask",
             path: "RETRIEVE",
@@ -361,11 +419,12 @@ export function ChatPanel({
               <AssistantTurn
                 key={turn.id}
                 response={turn.response}
-                streaming={turn.streaming ?? false}
+                phase={turn.phase}
+                streaming={turn.streaming}
                 saving={savingId === turn.id}
                 saved={savedIds.has(turn.id)}
                 onSave={() =>
-                  turn.response.type === "ask" && handleSaveGenerated(turn.id, turn.response.answer)
+                  turn.response?.type === "ask" && handleSaveGenerated(turn.id, turn.response.answer)
                 }
                 onCookRecipe={onCookRecipe}
               />
@@ -407,21 +466,44 @@ export function ChatPanel({
   );
 }
 
+const PHASE_LABELS: Record<ChatPhase, string> = {
+  classifying: "Reading your message…",
+  searching: "Searching your log…",
+  thinking: "Writing…",
+  logging: "Logging…",
+};
+
+/** The loading indicator for a turn with no response yet — replaces the old silent gap before/between classification, retrieval, and the model call. */
+function StatusPill({ phase }: { phase: ChatPhase }) {
+  return (
+    <div className="inline-flex items-center gap-2 rounded-full border border-hairline bg-card px-4 py-2 text-sm text-ink-muted shadow-card">
+      <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" />
+      {PHASE_LABELS[phase]}
+    </div>
+  );
+}
+
 function AssistantTurn({
   response,
+  phase,
   streaming,
   saving,
   saved,
   onSave,
   onCookRecipe,
 }: {
-  response: AssistantResponse;
+  response: AssistantResponse | null;
+  phase: ChatPhase | null;
   streaming: boolean;
   saving: boolean;
   saved: boolean;
   onSave: () => void;
   onCookRecipe: (recipe: CookModeData) => void;
 }) {
+  if (response === null) {
+    return <StatusPill phase={phase ?? "thinking"} />;
+  }
+
   if (response.type === "log") {
     if (response.saved && response.attempt) {
       return <AttemptCard attempt={response.attempt} />;
