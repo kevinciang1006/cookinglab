@@ -5,6 +5,23 @@
 
 export const AUTH_COOKIE_NAME = "cooking_lab_auth";
 
+/**
+ * True if this request actually arrived over HTTPS. Deliberately NOT based
+ * on NODE_ENV — `next start` sets NODE_ENV=production for every production
+ * deployment, including a plain-HTTP LAN box, so that's not a reliable proxy
+ * for "should this cookie be Secure?" (confirmed root cause of a broken
+ * login on the LAN pm2 deployment: NODE_ENV=production but no TLS, so a
+ * Secure cookie was set and every browser silently dropped it).
+ * Checks x-forwarded-proto first (sniffed correctly by Vercel/reverse
+ * proxies that terminate TLS in front of the app), falling back to the
+ * request URL's own protocol for a direct, unproxied connection.
+ */
+export function isRequestHttps(request: Request): boolean {
+  const forwardedProto = request.headers.get("x-forwarded-proto");
+  if (forwardedProto) return forwardedProto.split(",")[0].trim() === "https";
+  return new URL(request.url).protocol === "https:";
+}
+
 /** SHA-256 hex digest of `password` — what we store/compare in the cookie, so the raw password never sits in a browser-inspectable cookie value. */
 export async function hashAppPassword(password: string): Promise<string> {
   const data = new TextEncoder().encode(password);

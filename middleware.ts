@@ -14,10 +14,16 @@ export async function middleware(request: NextRequest) {
   if (appPassword && cookie) {
     const expected = await hashAppPassword(appPassword);
     if (cookie === expected) {
+      // TEMP DEBUG (login-auth-diagnosis, remove after):
+      console.log(`[middleware debug] ${request.nextUrl.pathname} — authed, passing through`);
       return NextResponse.next();
     }
   }
 
+  // TEMP DEBUG (login-auth-diagnosis, remove after):
+  console.log(
+    `[middleware debug] ${request.nextUrl.pathname} — NOT authed (cookiePresent: ${cookie !== undefined}, appPasswordSet: ${appPassword !== undefined}) — redirecting to /login`
+  );
   return NextResponse.redirect(new URL("/login", request.url));
 }
 
