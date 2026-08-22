@@ -2,9 +2,9 @@
 // cook-mode data entirely client-side, so opening the cook-mode drawer never
 // re-queries the model: the answer that's already on screen IS the source of
 // data (dish + ingredients + steps + the user's own logged learnings, via
-// the ANSWER_PROMPT's blockquote callouts). A heuristic parser, not a real
-// markdown AST walker — good enough because it only has to understand the
-// shapes ANSWER_PROMPT/ADAPT_PROMPT/GENERATE_PROMPT are asked to produce.
+// ANSWER_PROMPT's "### From your log" section). A heuristic parser, not a
+// real markdown AST walker — good enough because it only has to understand
+// the shapes ANSWER_PROMPT/ADAPT_PROMPT/GENERATE_PROMPT are asked to produce.
 
 export type ParsedRecipeStep = { text: string; minutes: number | null };
 
@@ -12,7 +12,7 @@ export type ParsedRecipe = {
   dish: string;
   ingredients: string[] | null;
   steps: ParsedRecipeStep[];
-  /** The user's own logged learnings/fixes, pulled from markdown blockquotes. */
+  /** The user's own logged learnings/fixes, pulled from the "### From your log" section (or a blockquote callout, as a fallback). */
   learnings: string[];
 };
 
@@ -114,20 +114,40 @@ export function parseRecipeMarkdown(markdown: string): ParsedRecipe | null {
     }
   }
 
-  // Learnings: consecutive blockquote ("> ...") lines, one entry per block.
-  const learnings: string[] = [];
+  // Learnings, preferred source: bullet items under a "### From your log"
+  // heading (any level) — ANSWER_PROMPT's dedicated section for the user's
+  // own logged fixes/lessons.
+  const sectionLearnings: string[] = [];
+  let inLearningsSection = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const headingMatch = trimmed.match(/^#{1,4}\s+(.+)/);
+    if (headingMatch) {
+      inLearningsSection = /from your log/i.test(headingMatch[1]);
+      continue;
+    }
+    if (inLearningsSection) {
+      const bulletMatch = trimmed.match(/^[-*]\s+(.+)/);
+      if (bulletMatch) sectionLearnings.push(stripEmphasis(bulletMatch[1]));
+    }
+  }
+
+  // Fallback: blockquote ("> ...") callouts, for ADAPT/GENERATE answers
+  // that don't follow the "### From your log" template.
+  const quoteLearnings: string[] = [];
   let currentQuote = "";
   for (const line of lines) {
     const quoteMatch = line.match(/^>\s?(.*)/);
     if (quoteMatch) {
       currentQuote = currentQuote ? `${currentQuote} ${quoteMatch[1]}` : quoteMatch[1];
     } else if (currentQuote) {
-      learnings.push(stripEmphasis(currentQuote));
+      quoteLearnings.push(stripEmphasis(currentQuote));
       currentQuote = "";
     }
   }
-  if (currentQuote) learnings.push(stripEmphasis(currentQuote));
+  if (currentQuote) quoteLearnings.push(stripEmphasis(currentQuote));
 
+  const learnings = sectionLearnings.length > 0 ? sectionLearnings : quoteLearnings;
   const ingredients = tableIngredients.length > 0 ? tableIngredients : bulletIngredients;
 
   return {
