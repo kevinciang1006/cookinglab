@@ -21,12 +21,28 @@ export { OllamaUnavailableError } from "@/lib/ollama";
 export const CLASSIFY_MODEL = "qwen2.5:7b";
 /** Structured extraction from freeform text (parse-log, generated-dish classification). Same tier as CLASSIFY_MODEL. */
 export const PARSE_MODEL = "qwen2.5:7b";
-/** Grounded answers, adaptation, and dish-memory distillation. */
-export const ANSWER_MODEL = "qwen3.5:9b-mlx";
-/** GENERATE-from-scratch (no logged grounding) and ungrounded cook-mode. */
-export const GENERATE_MODEL = "qwen3.5:9b-mlx";
+/**
+ * Grounded answers, adaptation, and dish-memory distillation.
+ * gpt-oss is a reasoning model — it emits a "thinking" trace ahead of the
+ * final answer, on a field Ollama keeps separate from message.content (see
+ * lib/ollama.ts). Its `think` option has no on/off switch — it REQUIRES one
+ * of "low"/"medium"/"high" (see callModel/callModelStream below), never
+ * `false` and never left unset.
+ */
+export const ANSWER_MODEL = "gpt-oss:20b";
+/** GENERATE-from-scratch (no logged grounding) and ungrounded cook-mode. Same model as ANSWER_MODEL, run at a higher think level (see synthesizeGenerated). */
+export const GENERATE_MODEL = "gpt-oss:20b";
 /** Embeddings — 768-dim native size (see 0008_switch_to_ollama_embeddings.sql). */
 export const EMBED_MODEL = "nomic-embed-text";
+
+// gpt-oss:20b's cold load is ~21s — worth paying once and staying resident
+// rather than on every single answer. -1 tells Ollama to keep it loaded
+// indefinitely (Ollama's keep_alive semantics). Deliberately NOT applied to
+// CLASSIFY_MODEL/PARSE_MODEL/EMBED_MODEL — those are cheap to reload, and
+// gpt-oss:20b (~13GB) is already close to the box's wired-memory limit, so
+// keeping only the one expensive model pinned resident is the right
+// trade-off, not every model this app uses.
+const GPT_OSS_KEEP_ALIVE = -1;
 
 // v1a: below this cosine similarity, a match_attempts hit is noise, not a
 // real answer. Originally measured against Gemini's gemini-embedding-001;
@@ -386,6 +402,47 @@ function getSupabaseAdmin() {
   return supabaseAdmin;
 }
 
+// gpt-oss should never leak its reasoning trace into the answer (it streams
+// on a separate "thinking" field that lib/ollama.ts never even reads — see
+// there), but this is a defensive last line: if a preamble like "Let's
+// produce a clean, well-structured... done thinking." ever ends up inside
+// message.content anyway, strip it before anything reaches the user. Only
+// engaged for calls using a gpt-oss-style string `think` level (checked via
+// `typeof think === "string"` at the call sites below) — plain
+// classify/parse calls never touch this.
+const THINKING_PREAMBLE_RE = /^[\s\S]*?done thinking\.?\s*/i;
+// How much text to hold back, at most, while checking for a leaked
+// preamble marker before giving up and treating everything seen so far as
+// real answer content. Small enough to be an imperceptible delay on top of
+// the "Writing…" status pill already covering this exact window — not a
+// second dead-air gap.
+const THINKING_PREAMBLE_SCAN_LIMIT = 300;
+
+/** One-shot defensive strip for non-streaming calls — cheap, no streaming complexity to worry about. */
+function stripThinkingPreamble(text: string): string {
+  return text.replace(THINKING_PREAMBLE_RE, "");
+}
+
+/** Stateful defensive filter for streaming calls — see THINKING_PREAMBLE_SCAN_LIMIT above for the trade-off this makes. */
+function createThinkingPreambleFilter(): (chunk: string) => string {
+  let buffered = "";
+  let resolved = false;
+  return (chunk: string): string => {
+    if (resolved) return chunk;
+    buffered += chunk;
+    const match = buffered.match(THINKING_PREAMBLE_RE);
+    if (match) {
+      resolved = true;
+      return buffered.slice(match[0].length);
+    }
+    if (buffered.length >= THINKING_PREAMBLE_SCAN_LIMIT) {
+      resolved = true;
+      return buffered;
+    }
+    return ""; // still within the scan window, no marker seen yet — hold back
+  };
+}
+
 /**
  * Shared wrapper around every chat call in this module. Any connection
  * failure (Ollama not running / wrong port) surfaces as
@@ -403,16 +460,18 @@ async function callModel(params: {
   temperature?: number;
   maxOutputTokens?: number;
   json?: boolean;
+  /** Reasoning control — boolean for plain models (false = no visible chain-of-thought), a level string for gpt-oss (which has no off switch; see ANSWER_MODEL above). Defaults to false. */
+  think?: boolean | "low" | "medium" | "high";
+  keepAlive?: number;
 }): Promise<string> {
+  let text: string;
   try {
-    return await chat(params.model, params.systemInstruction, params.contents, {
+    text = await chat(params.model, params.systemInstruction, params.contents, {
       json: params.json,
       temperature: params.temperature,
       maxTokens: params.maxOutputTokens,
-      // None of this app's prompts want visible chain-of-thought in the
-      // output (whether prose or JSON) — disabled universally rather than
-      // per-call, harmless no-op for models without hybrid reasoning.
-      think: false,
+      think: params.think ?? false,
+      keepAlive: params.keepAlive,
     });
   } catch (err) {
     if (err instanceof OllamaUnavailableError) throw err;
@@ -420,6 +479,7 @@ async function callModel(params: {
       `Ollama ${params.label} request failed (model=${params.model}): ${err instanceof Error ? err.message : String(err)}`
     );
   }
+  return typeof params.think === "string" ? stripThinkingPreamble(text) : text;
 }
 
 /**
@@ -437,12 +497,20 @@ async function* callModelStream(params: {
   label: string;
   errorClass: new (message: string) => Error;
   temperature?: number;
+  think?: boolean | "low" | "medium" | "high";
+  keepAlive?: number;
 }): AsyncGenerator<string, void, unknown> {
+  const filter = typeof params.think === "string" ? createThinkingPreambleFilter() : null;
   try {
-    yield* chatStream(params.model, params.systemInstruction, params.contents, {
+    const chunks = chatStream(params.model, params.systemInstruction, params.contents, {
       temperature: params.temperature,
-      think: false,
+      think: params.think ?? false,
+      keepAlive: params.keepAlive,
     });
+    for await (const chunk of chunks) {
+      const out = filter ? filter(chunk) : chunk;
+      if (out) yield out;
+    }
   } catch (err) {
     if (err instanceof OllamaUnavailableError) throw err;
     throw new params.errorClass(
@@ -599,6 +667,11 @@ export async function synthesizeAnswer(
     // Low and steady — the template + worked example only pay off if the
     // model reliably reproduces the structure rather than wandering.
     temperature: 0.3,
+    // Low reasoning effort — this is a grounded rewrite of retrieved
+    // context, not a problem the model needs to reason hard about; keeps
+    // the (already-hidden) thinking phase short.
+    think: "low",
+    keepAlive: GPT_OSS_KEEP_ALIVE,
   });
   return text.trim();
 }
@@ -618,6 +691,8 @@ export function synthesizeAnswerStream(
     label: "answer",
     errorClass: AnswerError,
     temperature: 0.3,
+    think: "low",
+    keepAlive: GPT_OSS_KEEP_ALIVE,
   });
 }
 
@@ -732,6 +807,8 @@ export async function synthesizeAdaptation(
     systemInstruction: ADAPT_PROMPT,
     label: "adapt",
     errorClass: AnswerError,
+    think: "low",
+    keepAlive: GPT_OSS_KEEP_ALIVE,
   });
   return text.trim();
 }
@@ -750,6 +827,8 @@ export function synthesizeAdaptationStream(
     systemInstruction: ADAPT_PROMPT,
     label: "adapt",
     errorClass: AnswerError,
+    think: "low",
+    keepAlive: GPT_OSS_KEEP_ALIVE,
   });
 }
 
@@ -765,6 +844,10 @@ export async function synthesizeGenerated(question: string): Promise<string> {
     systemInstruction: GENERATE_PROMPT,
     label: "generate",
     errorClass: AnswerError,
+    // Medium — this path has no logged grounding to lean on, so it's worth
+    // letting the model reason a bit harder over a genuinely novel answer.
+    think: "medium",
+    keepAlive: GPT_OSS_KEEP_ALIVE,
   });
   return text.trim();
 }
@@ -777,6 +860,8 @@ export function synthesizeGeneratedStream(question: string): AsyncGenerator<stri
     systemInstruction: GENERATE_PROMPT,
     label: "generate",
     errorClass: AnswerError,
+    think: "medium",
+    keepAlive: GPT_OSS_KEEP_ALIVE,
   });
 }
 
@@ -898,6 +983,8 @@ export async function synthesizeCookRecipe(
     label: "cook-mode",
     errorClass: AnswerError,
     json: true,
+    think: baseAttempt ? "low" : "medium",
+    keepAlive: GPT_OSS_KEEP_ALIVE,
   });
 
   let parsed: {
@@ -994,6 +1081,8 @@ export async function regenerateDishMemory(dish: string): Promise<string[] | nul
     label: "dish-memory",
     errorClass: AnswerError,
     json: true,
+    think: "low",
+    keepAlive: GPT_OSS_KEEP_ALIVE,
   });
 
   let parsed: { bullets?: unknown };
