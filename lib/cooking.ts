@@ -155,15 +155,41 @@ Return ONLY a JSON object: {"path": "RETRIEVE" | "ADAPT" | "GENERATE"}
 When in doubt between RETRIEVE and ADAPT, prefer RETRIEVE unless the user is
 clearly asking for a changed/adjusted version of a specific past attempt.`;
 
+// Same template shape as ANSWER_PROMPT, deliberately — a differently-shaped
+// answer (e.g. a "Step | Detail" table instead of "Ingredient | Amount",
+// or the real heading as **bold** text instead of a markdown heading) isn't
+// just a cosmetic difference: lib/parseRecipeMarkdown.ts's heuristics (used
+// for both cook-mode's "Let's cook this" and "Save as recipe") assume this
+// exact shape to find the dish/ingredients/steps at all. Confirmed live:
+// before this, an ADAPT answer with its own format got its dish name,
+// ingredients, and steps all mismapped (a "what we'll change" list saved as
+// the steps, a "Step | Detail" table saved as the ingredients).
 const ADAPT_PROMPT = `You are adapting one of the user's own logged cooking attempts to a new
 request (e.g. scaling, ingredient substitution, adjusting for equipment or
 conditions). You will be given the request and the relevant logged
-attempt(s) to adapt.
+attempt(s) to adapt. Follow this exact template:
+
+## <Dish Name>
+<one-line intro grounded in the log — what you're adapting and the requested change>
+
+### Ingredients
+| Ingredient | Amount |
+|---|---|
+<one row per ingredient, adjusted for the requested change>
+
+### Steps
+1. <step>
+2. <step — **bold** the specific move that differs from the original attempt because of this adaptation>
+...
+
+### From your log
+- <what the original logged attempt(s) actually say that this adaptation is based on>
+
 Rules:
 - Base the adaptation on the provided attempt(s) — don't invent an unrelated
   recipe. Cite which attempt(s) you're adapting from (by dish + what
-  happened).
-- Apply the requested change explicitly and show the adjusted recipe/steps,
+  happened) in the intro and/or "From your log" section.
+- Apply the requested change explicitly in the ingredients/steps themselves,
   not just a description of the change.
 - Where the adaptation requires general cooking knowledge (e.g. scaling
   math, a substitution's effect on flavor or texture), it's fine to bring
@@ -174,13 +200,27 @@ Rules:
 const GENERATE_PROMPT = `The user wants a cooking suggestion that isn't grounded in their logged
 history — nothing relevant was found, or they explicitly asked for
 something new. You may use general cooking knowledge freely here (this is
-the one path allowed to).
+the one path allowed to). Follow this exact template:
+
+## <Dish Name>
+<one-line intro>
+
+### Ingredients
+| Ingredient | Amount |
+|---|---|
+<one row per ingredient>
+
+### Steps
+1. <step>
+2. <step — **bold** the specific moves/warnings that matter most>
+...
+
 Rules:
-- Produce a genuinely useful, concrete recipe or suggestion — actual
-  ingredients/steps, not vague advice.
+- Produce a genuinely useful, concrete recipe — actual ingredients/steps
+  with real quantities, not vague advice.
 - Be concise and practical.
 - If the question isn't about cooking at all, say so plainly rather than
-  making something up.
+  making something up (skip the template in that case).
 Do not claim this came from the user's own log — it didn't.`;
 
 const GENERATED_DISH_PROMPT = `Given a generated cooking recipe or suggestion, return ONLY a JSON object:

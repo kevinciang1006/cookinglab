@@ -53,18 +53,24 @@ export function parseRecipeMarkdown(markdown: string): ParsedRecipe | null {
     }
   }
 
-  // Ingredients, preferred source: the first markdown table — each data row
+  // Ingredients, preferred source: the first markdown table whose header
+  // row actually says "ingredient" — not just any table (an ADAPT answer's
+  // own "Step | Detail" table, for instance, is NOT this, and mismapping
+  // it here silently produces a "recipe" whose ingredients are actually
+  // steps — confirmed live before this check existed). Each data row
   // (skipping the header row and the |---|---| separator) becomes
   // "Ingredient — Amount".
   const tableIngredients: string[] = [];
   let sawTable = false;
   let tableRowIndex = 0;
+  let isIngredientTable = false;
   for (const line of lines) {
     const trimmed = line.trim();
     const isTableRow = /^\|.*\|$/.test(trimmed);
     if (isTableRow) {
+      if (!sawTable) isIngredientTable = /ingredient/i.test(trimmed);
       sawTable = true;
-      if (tableRowIndex >= 2) {
+      if (isIngredientTable && tableRowIndex >= 2) {
         const cells = trimmed
           .slice(1, -1)
           .split("|")
@@ -75,9 +81,10 @@ export function parseRecipeMarkdown(markdown: string): ParsedRecipe | null {
       }
       tableRowIndex++;
     } else if (sawTable && trimmed === "") {
-      if (tableIngredients.length > 0) break; // stop at the first table found
+      if (isIngredientTable && tableIngredients.length > 0) break; // stop at the first ingredient table found
       sawTable = false;
       tableRowIndex = 0;
+      isIngredientTable = false;
     }
   }
 
@@ -210,18 +217,24 @@ export function extractRecipeForSave(markdown: string): ExtractedRecipe | null {
     }
   }
 
-  // Ingredients, preferred source: the first markdown table — kept as
-  // structured {item, amount} pairs here (parseRecipeMarkdown joins these
-  // into one display string instead; this function doesn't).
+  // Ingredients, preferred source: the first markdown table whose header
+  // row actually says "ingredient" (not e.g. an ADAPT answer's own
+  // "Step | Detail" table — mismapping that here silently saves a
+  // "recipe" whose ingredients are actually steps; confirmed live before
+  // this check existed) — kept as structured {item, amount} pairs here
+  // (parseRecipeMarkdown joins these into one display string instead;
+  // this function doesn't).
   const tableIngredients: RecipeIngredient[] = [];
   let sawTable = false;
   let tableRowIndex = 0;
+  let isIngredientTable = false;
   for (const line of lines) {
     const trimmed = line.trim();
     const isTableRow = /^\|.*\|$/.test(trimmed);
     if (isTableRow) {
+      if (!sawTable) isIngredientTable = /ingredient/i.test(trimmed);
       sawTable = true;
-      if (tableRowIndex >= 2) {
+      if (isIngredientTable && tableRowIndex >= 2) {
         const cells = trimmed
           .slice(1, -1)
           .split("|")
@@ -230,9 +243,10 @@ export function extractRecipeForSave(markdown: string): ExtractedRecipe | null {
       }
       tableRowIndex++;
     } else if (sawTable && trimmed === "") {
-      if (tableIngredients.length > 0) break;
+      if (isIngredientTable && tableIngredients.length > 0) break;
       sawTable = false;
       tableRowIndex = 0;
+      isIngredientTable = false;
     }
   }
 
