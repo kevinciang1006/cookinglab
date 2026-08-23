@@ -1440,11 +1440,40 @@ export async function matchRecipes(
 }
 
 /**
+ * Case-insensitive, trimmed exact match against recipes.dish — the fast
+ * path for checkSavedRecipe. Covers dish-scoped chat (dishFilter is the
+ * authoritative dish name from the URL, which may differ from the stored
+ * row only in case) and the case where a free-text question happens to
+ * state the dish name outright. `.ilike` with no wildcards is Postgres's
+ * case-insensitive equality; `.trim()` on the input handles the "trimmed"
+ * half (stored dish names are already clean).
+ */
+async function findRecipeByNormalizedName(name: string): Promise<Recipe | null> {
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  const { data, error } = await getSupabaseAdmin()
+    .from("recipes")
+    .select(RECIPE_COLUMNS)
+    .ilike("dish", trimmed)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? rowToRecipe(data as unknown as Database["public"]["Tables"]["recipes"]["Row"]) : null;
+}
+
+/**
  * Checks whether a saved recipe answers this "how do I make X" request —
  * the whole point of the recipes layer: return what was actually saved
  * instead of letting the model reconstruct (and potentially invent
  * details) from attempt notes. Returns null if this isn't a recipe
- * request, or no saved recipe clears RECIPE_MATCH_THRESHOLD.
+ * request, or no saved recipe is found by either method.
+ *
+ * Two-step lookup, in order:
+ * 1. Normalized dish-name match (see findRecipeByNormalizedName) — cheap,
+ *    exact, and the only path dish-scoped chat needs.
+ * 2. Vector similarity over recipe embeddings (match_recipes RPC) — the
+ *    common path for free-text questions ("how to make hong kong steamed
+ *    fish" won't literally equal the saved "hong kong style steamed
+ *    fish", but its embedding is close enough to clear the threshold).
  */
 export async function checkSavedRecipe(
   question: string,
@@ -1453,6 +1482,10 @@ export async function checkSavedRecipe(
 ): Promise<Recipe | null> {
   const isRecipeRequest = await classifyRecipeRequest(question);
   if (!isRecipeRequest) return null;
+
+  const nameCandidate = dishFilter ?? question;
+  const byName = await findRecipeByNormalizedName(nameCandidate);
+  if (byName) return byName;
 
   const matches = await matchRecipes(queryEmbedding, 1, dishFilter);
   const best = matches[0];
