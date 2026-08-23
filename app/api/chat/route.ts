@@ -11,6 +11,8 @@ import {
   classifyAskIntent,
   classifyChatIntent,
   detectCookAlongIntent,
+  checkSavedRecipe,
+  buildAnswerFromSavedRecipe,
   regenerateDishMemory,
   RELEVANCE_THRESHOLD,
   EMBED_MODEL,
@@ -213,6 +215,18 @@ export async function POST(request: Request) {
         const bestMatch = relevant.length > 0 ? relevant[0] : null;
         const recipe = await synthesizeCookRecipe(contextualMessage, bestMatch);
         emit({ type: "result", response: { type: "cook", recipe } });
+        return;
+      }
+
+      // Saved recipe check — takes priority over RETRIEVE/ADAPT/GENERATE
+      // entirely: if this dish already has a saved recipe, return exactly
+      // what was saved (no model call, so it can't invent ingredients)
+      // instead of letting classifyAskIntent route to a reconstruction.
+      const savedRecipe = await checkSavedRecipe(contextualMessage, queryEmbedding, dishFilter);
+      if (savedRecipe) {
+        const answer = await buildAnswerFromSavedRecipe(savedRecipe);
+        emit({ type: "meta", meta: { type: "ask", path: "RECIPE", matches: relevant, savable: false } });
+        emit({ type: "token", text: answer });
         return;
       }
 

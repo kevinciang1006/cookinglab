@@ -237,6 +237,15 @@ const COOK_ALONG_PROMPT = `Does the user want to cook along with step-by-step gu
 as opposed to just asking a question or wanting a written recipe/answer?
 Return ONLY a JSON object: {"cookAlong": true | false}`;
 
+// v-recipes: another lightweight pre-check, orthogonal to RETRIEVE/ADAPT/
+// GENERATE — this is about whether to check the recipes table FIRST before
+// falling back to reconstructing an answer from attempt notes.
+const RECIPE_REQUEST_PROMPT = `Does the user want a full recipe/cooking method for a specific dish (e.g. "how do
+I make X", "how to make X", "recipe for X", "how to cook X"), as opposed to a
+diagnostic or analytical question about their own cooking (e.g. "why does X
+turn out Y", "what have I learned about X", "what's worked before for Y")?
+Return ONLY a JSON object: {"isRecipeRequest": true | false}`;
+
 const COOK_MODE_PROMPT = `You produce a step-by-step cooking guide for the user to follow along with
 right now. Return ONLY a JSON object:
 {
@@ -431,6 +440,23 @@ type Database = {
           rating: number | null;
           cooked_at: string;
           target: string | null;
+          similarity: number;
+        }[];
+      };
+      // 0010_add_match_recipes_rpc.sql — mirrors match_attempts, over
+      // recipes instead: "is there already a saved recipe for this dish?"
+      match_recipes: {
+        Args: { query_embedding: number[]; match_count?: number };
+        Returns: {
+          id: string;
+          dish: string;
+          variation_label: string | null;
+          ingredients: unknown;
+          steps: unknown;
+          summary: string | null;
+          source_answer: string | null;
+          created_at: string;
+          updated_at: string;
           similarity: number;
         }[];
       };
@@ -803,8 +829,13 @@ export async function deleteAttempt(id: string): Promise<void> {
   if (error) throw error;
 }
 
-/** Which of the three ask-agent paths ran (v1c). */
-export type AskPath = "RETRIEVE" | "ADAPT" | "GENERATE";
+/**
+ * Which path answered a QUERY. RETRIEVE/ADAPT/GENERATE are the original
+ * three (v1c). RECIPE is new: a "how do I make X" question answered
+ * directly from a saved recipes-table row — grounded in exactly what was
+ * saved, not reconstructed from attempt notes (see checkSavedRecipe).
+ */
+export type AskPath = "RETRIEVE" | "ADAPT" | "GENERATE" | "RECIPE";
 
 /**
  * Classifies intent among RETRIEVE/ADAPT/GENERATE given the question and the
@@ -995,6 +1026,29 @@ export async function detectCookAlongIntent(question: string): Promise<boolean> 
   }
 
   return parsed.cookAlong === true;
+}
+
+/** Detects "how do I make X" recipe requests — checked against the recipes table before falling back to reconstructing an answer from attempts (see checkSavedRecipe). */
+export async function classifyRecipeRequest(question: string): Promise<boolean> {
+  const text = await callModel({
+    model: CLASSIFY_MODEL,
+    contents: question,
+    systemInstruction: RECIPE_REQUEST_PROMPT,
+    label: "recipe-request",
+    errorClass: AnswerError,
+    temperature: 0,
+    maxOutputTokens: 200,
+    json: true,
+  });
+
+  let parsed: { isRecipeRequest?: boolean };
+  try {
+    parsed = JSON.parse(text) as { isRecipeRequest?: boolean };
+  } catch {
+    throw new AnswerError("Ollama returned unparsable recipe-request classification JSON");
+  }
+
+  return parsed.isRecipeRequest === true;
 }
 
 /** One step in a cook-mode recipe; `minutes` is set only for timed steps. */
@@ -1348,6 +1402,110 @@ export async function upsertRecipe(input: UpsertRecipeInput): Promise<Recipe> {
 export async function deleteRecipe(id: string): Promise<void> {
   const { error } = await getSupabaseAdmin().from("recipes").delete().eq("id", id);
   if (error) throw error;
+}
+
+/** One vector-search result from the match_recipes RPC — mirrors AttemptMatch. */
+export type RecipeMatch = Recipe & { similarity: number };
+
+// Same value as RELEVANCE_THRESHOLD, kept as its own constant since recipe
+// matching and attempt matching are different embedding spaces (recipes
+// embed dish+variation+summary+ingredients; attempts embed dish+analysis/
+// outcome/changes) — may need separate tuning once there's enough saved
+// recipes to measure against.
+const RECIPE_MATCH_THRESHOLD = 0.6;
+
+/**
+ * Vector search over saved recipes via the match_recipes Postgres function
+ * — mirrors matchAttempts. `dishFilter`, when given, only returns matches
+ * for that exact dish (used by dish-scoped chat, same convention as
+ * matchAttempts).
+ */
+export async function matchRecipes(
+  queryEmbedding: number[],
+  matchCount = 5,
+  dishFilter?: string
+): Promise<RecipeMatch[]> {
+  const { data, error } = await getSupabaseAdmin().rpc("match_recipes", {
+    query_embedding: queryEmbedding,
+    match_count: dishFilter ? Math.max(matchCount * 5, 40) : matchCount,
+  });
+  if (error) throw error;
+
+  let results = (data ?? []).map((row) => ({
+    ...rowToRecipe(row as unknown as Database["public"]["Tables"]["recipes"]["Row"]),
+    similarity: (row as unknown as { similarity: number }).similarity,
+  }));
+  if (dishFilter) results = results.filter((r) => r.dish === dishFilter).slice(0, matchCount);
+  return results;
+}
+
+/**
+ * Checks whether a saved recipe answers this "how do I make X" request —
+ * the whole point of the recipes layer: return what was actually saved
+ * instead of letting the model reconstruct (and potentially invent
+ * details) from attempt notes. Returns null if this isn't a recipe
+ * request, or no saved recipe clears RECIPE_MATCH_THRESHOLD.
+ */
+export async function checkSavedRecipe(
+  question: string,
+  queryEmbedding: number[],
+  dishFilter?: string
+): Promise<Recipe | null> {
+  const isRecipeRequest = await classifyRecipeRequest(question);
+  if (!isRecipeRequest) return null;
+
+  const matches = await matchRecipes(queryEmbedding, 1, dishFilter);
+  const best = matches[0];
+  if (!best || best.similarity < RECIPE_MATCH_THRESHOLD) return null;
+  return best;
+}
+
+/**
+ * Builds a markdown answer directly from a saved recipe — deterministic,
+ * no model call, so it can never invent an ingredient/step the recipe
+ * doesn't actually have (the whole reason this exists: "how do I make my
+ * steamed fish" should return what was actually saved, not a
+ * reconstruction that might add an oyster sauce that was never there).
+ * Weaves in the dish's cached memory bullets as supporting "from your log"
+ * context, same as a model-generated answer would — and in the same
+ * template shape, so cook-mode/"Save as recipe" parsing still works on it.
+ */
+export async function buildAnswerFromSavedRecipe(recipe: Recipe): Promise<string> {
+  const lines: string[] = [];
+  lines.push(`## ${recipe.dish}${recipe.variationLabel ? ` (${recipe.variationLabel})` : ""}`);
+  lines.push("");
+  lines.push(recipe.summary ? `*Your saved recipe.* ${recipe.summary}` : "*Your saved recipe.*");
+
+  if (recipe.ingredients.length > 0) {
+    lines.push("");
+    lines.push("### Ingredients");
+    lines.push("| Ingredient | Amount |");
+    lines.push("|---|---|");
+    for (const ingredient of recipe.ingredients) {
+      lines.push(`| ${ingredient.item} | ${ingredient.amount ?? ""} |`);
+    }
+  }
+
+  if (recipe.steps.length > 0) {
+    lines.push("");
+    lines.push("### Steps");
+    recipe.steps.forEach((step, i) => lines.push(`${i + 1}. ${step.text}`));
+  }
+
+  // Supporting context only — degrade silently if it fails, never block
+  // the saved recipe (the actual answer) on it.
+  try {
+    const memory = await getDishMemory(recipe.dish);
+    if (memory.bullets && memory.bullets.length > 0) {
+      lines.push("");
+      lines.push("### From your log");
+      for (const bullet of memory.bullets) lines.push(`- ${bullet}`);
+    }
+  } catch (err) {
+    console.error("buildAnswerFromSavedRecipe: getDishMemory failed (serving recipe without it):", err);
+  }
+
+  return lines.join("\n");
 }
 
 /** Per-dish activity summary — feeds the Recent tab's "Continue" section. */

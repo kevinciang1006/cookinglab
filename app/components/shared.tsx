@@ -103,13 +103,17 @@ export function PathTag({ path }: { path: AskPath }) {
       ? "New — not from your log"
       : path === "ADAPT"
         ? "Adapted from your log"
-        : "From your log";
+        : path === "RECIPE"
+          ? "Your saved recipe"
+          : "From your log";
   return (
     <span
       className={`inline-flex items-center rounded-full px-3 py-1 font-mono text-[11px] font-semibold uppercase tracking-wide ${
         path === "GENERATE"
           ? "bg-accent-soft text-accent"
-          : "border border-hairline text-ink-muted"
+          : path === "RECIPE"
+            ? "bg-accent text-card"
+            : "border border-hairline text-ink-muted"
       }`}
     >
       {label}
