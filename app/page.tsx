@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import type { Attempt, AttemptKind } from "@/lib/cooking";
+import type { Attempt, AttemptKind, DishActivity } from "@/lib/cooking";
 import { ChatPanel, CookDrawer, RatingChip, type CookModeData } from "@/app/components/shared";
 
 type TabId = "chat" | "recent";
@@ -14,7 +14,7 @@ const TABS: { id: TabId; label: string }[] = [
 
 const TAB_TITLES: Record<TabId, string> = {
   chat: "Cooking Lab",
-  recent: "Recent cooks",
+  recent: "Continue",
 };
 
 type EditDraft = {
@@ -40,6 +40,9 @@ export default function Home() {
   const [recent, setRecent] = useState<Attempt[]>([]);
   const [recentLoading, setRecentLoading] = useState(true);
 
+  const [dishes, setDishes] = useState<DishActivity[]>([]);
+  const [dishesLoading, setDishesLoading] = useState(true);
+
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
   const [editSaving, setEditSaving] = useState(false);
@@ -54,9 +57,27 @@ export default function Home() {
     }
   }
 
+  async function refreshDishes() {
+    try {
+      const res = await fetch("/api/dishes");
+      if (res.ok) setDishes(await res.json());
+    } finally {
+      setDishesLoading(false);
+    }
+  }
+
   useEffect(() => {
     refreshRecent();
+    refreshDishes();
   }, []);
+
+  useEffect(() => {
+    // Continue reflects activity from anywhere in the app (a recipe saved
+    // from chat, an attempt logged on a dish page) — refetch it fresh each
+    // time this tab is actually viewed, rather than trying to thread an
+    // invalidation callback through every place that can create activity.
+    if (activeTab === "recent") refreshDishes();
+  }, [activeTab]);
 
   function startEdit(attempt: Attempt) {
     setEditingId(attempt.id);
@@ -149,6 +170,8 @@ export default function Home() {
               <RecentTab
                 recent={recent}
                 loading={recentLoading}
+                dishes={dishes}
+                dishesLoading={dishesLoading}
                 editingId={editingId}
                 editDraft={editDraft}
                 editSaving={editSaving}
@@ -277,6 +300,8 @@ function groupByDish(attempts: Attempt[]): DishGroup[] {
 function RecentTab({
   recent,
   loading,
+  dishes,
+  dishesLoading,
   editingId,
   editDraft,
   editSaving,
@@ -289,6 +314,8 @@ function RecentTab({
 }: {
   recent: Attempt[];
   loading: boolean;
+  dishes: DishActivity[];
+  dishesLoading: boolean;
   editingId: string | null;
   editDraft: EditDraft | null;
   editSaving: boolean;
@@ -302,11 +329,11 @@ function RecentTab({
   const router = useRouter();
   const groups = useMemo(() => groupByDish(recent), [recent]);
 
-  if (loading) {
+  if (loading && dishesLoading) {
     return <p className="py-8 text-center text-sm text-ink-muted">Loading…</p>;
   }
 
-  if (recent.length === 0) {
+  if (!dishesLoading && dishes.length === 0 && recent.length === 0) {
     return (
       <div className="mt-4 rounded-2xl border border-dashed border-hairline px-5 py-8 text-center">
         <p className="text-sm text-ink-muted">Nothing logged yet — your first cook will show up here.</p>
@@ -315,7 +342,16 @@ function RecentTab({
   }
 
   return (
-    <div className="space-y-4 py-4">
+    <div className="py-4">
+      <ContinueSection dishes={dishes} loading={dishesLoading} />
+
+      {groups.length > 0 && (
+        <h2 className="mb-3 font-mono text-[11px] uppercase tracking-[0.16em] text-ink-faint">
+          All dishes
+        </h2>
+      )}
+
+      <div className="space-y-4">
       {groups.map((group) => (
         <div
           key={group.dish}
@@ -358,6 +394,53 @@ function RecentTab({
           </div>
         </div>
       ))}
+      </div>
+    </div>
+  );
+}
+
+function ContinueSection({ dishes, loading }: { dishes: DishActivity[]; loading: boolean }) {
+  const router = useRouter();
+
+  if (loading) {
+    return <p className="mb-6 py-4 text-center text-sm text-ink-muted">Loading…</p>;
+  }
+  if (dishes.length === 0) return null;
+
+  const top = dishes.slice(0, 5);
+
+  return (
+    <div className="mb-6">
+      <h2 className="mb-3 font-mono text-[11px] uppercase tracking-[0.16em] text-ink-faint">Continue</h2>
+      <div className="space-y-3">
+        {top.map((d) => (
+          <div
+            key={d.dish}
+            role="link"
+            tabIndex={0}
+            onClick={() => router.push(`/dish/${encodeURIComponent(d.dish)}`)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") router.push(`/dish/${encodeURIComponent(d.dish)}`);
+            }}
+            className="cursor-pointer rounded-2xl border border-hairline bg-card px-4 py-3 shadow-card transition-shadow hover:shadow-lift"
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="font-mono text-base font-medium text-ink">{d.dish}</h3>
+              {d.hasRecipe && (
+                <span className="inline-flex items-center rounded-full bg-accent-soft px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-accent">
+                  recipe
+                </span>
+              )}
+              {d.attemptCount > 0 && (
+                <span className="font-mono text-xs text-ink-faint">
+                  {d.attemptCount} attempt{d.attemptCount === 1 ? "" : "s"}
+                </span>
+              )}
+            </div>
+            <p className="mt-1 truncate text-sm text-ink-muted">{d.lastActivityLabel}</p>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -324,23 +324,34 @@ type Database = {
         Update: Partial<Database["public"]["Tables"]["attempts"]["Insert"]>;
         Relationships: [];
       };
+      // v-recipes: the cookable artifact (current best ingredients + steps
+      // for a dish/variation), distinct from attempts (the log). Renamed
+      // from the original PRD stub (name→dish, notes→summary) and extended
+      // (0009_recipes_layer.sql) — was never actually populated before this.
       recipes: {
         Row: {
           id: string;
-          name: string;
+          dish: string;
+          variation_label: string | null;
           aliases: string[] | null;
           base_servings: number | null;
           ingredients: unknown | null;
           steps: unknown | null;
           source: string | null;
-          notes: string | null;
+          summary: string | null;
+          source_answer: string | null;
           embedding: number[] | null;
           created_at: string;
           updated_at: string;
         };
         Insert: {
-          name: string;
-          notes?: string | null;
+          dish: string;
+          variation_label?: string | null;
+          ingredients?: unknown | null;
+          steps?: unknown | null;
+          summary?: string | null;
+          source_answer?: string | null;
+          embedding?: number[] | null;
           updated_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["recipes"]["Insert"]>;
@@ -1039,8 +1050,8 @@ export async function classifyChatIntent(message: string): Promise<ChatIntent> {
   return parsed.intent === "LOG" ? "LOG" : "QUERY";
 }
 
-/** Fetches every attempt logged for `dish`, oldest first (v1d dish memory). */
-async function getAttemptsForDish(dish: string): Promise<Attempt[]> {
+/** Fetches every attempt logged for `dish`, oldest first (v1d dish memory; also used by the dish page's attempt-history section). */
+export async function getAttemptsForDish(dish: string): Promise<Attempt[]> {
   const { data, error } = await getSupabaseAdmin()
     .from("attempts")
     .select("id, dish, rating, changes, outcome, analysis, target, kind, cooked_at")
@@ -1173,4 +1184,219 @@ export async function getDishMemory(dish: string): Promise<DishMemory> {
     const stale = data?.summary ? parseCachedSummary(data.summary) : null;
     return { bullets: stale, attemptCount, ...(unavailable && { unavailable: true }) };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Recipes layer — the cookable artifact (current best ingredients + steps
+// for a dish/variation), distinct from attempts (the log, unchanged above).
+// Saved from a chat answer via POST /api/recipes, which parses the answer
+// (lib/parseRecipeMarkdown.ts's extractRecipeForSave) and calls upsertRecipe
+// below with the result — this module just owns the DB side.
+// ---------------------------------------------------------------------------
+
+/** One row of the recipes table's ingredients jsonb column. */
+export type RecipeIngredient = { item: string; amount: string | null };
+
+/** A saved recipe — the current best ingredients + steps for one dish/variation. */
+export type Recipe = {
+  id: string;
+  dish: string;
+  /** e.g. "ayam kampung, pressure cooker" — null means the canonical/no-variation recipe for this dish. */
+  variationLabel: string | null;
+  ingredients: RecipeIngredient[];
+  steps: CookStep[];
+  summary: string | null;
+  /** The raw chat answer this was distilled from. */
+  sourceAnswer: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type UpsertRecipeInput = {
+  dish: string;
+  variationLabel: string | null;
+  ingredients: RecipeIngredient[];
+  steps: CookStep[];
+  summary: string | null;
+  sourceAnswer: string | null;
+};
+
+function rowToRecipe(row: Database["public"]["Tables"]["recipes"]["Row"]): Recipe {
+  return {
+    id: row.id,
+    dish: row.dish,
+    variationLabel: row.variation_label,
+    ingredients: Array.isArray(row.ingredients) ? (row.ingredients as RecipeIngredient[]) : [],
+    steps: Array.isArray(row.steps) ? (row.steps as CookStep[]) : [],
+    summary: row.summary,
+    sourceAnswer: row.source_answer,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+const RECIPE_COLUMNS = "id, dish, variation_label, ingredients, steps, summary, source_answer, created_at, updated_at";
+
+/** Lists every saved recipe (variation) for a dish, most recently updated first. */
+export async function listRecipesForDish(dish: string): Promise<Recipe[]> {
+  const { data, error } = await getSupabaseAdmin()
+    .from("recipes")
+    .select(RECIPE_COLUMNS)
+    .eq("dish", dish)
+    .order("updated_at", { ascending: false });
+  if (error) throw error;
+  return (data ?? []).map((row) => rowToRecipe(row as unknown as Database["public"]["Tables"]["recipes"]["Row"]));
+}
+
+/** Composes the text embedded for a recipe — used for future retrieval/search over saved recipes. */
+function composeRecipeEmbedText(input: {
+  dish: string;
+  variationLabel: string | null;
+  summary: string | null;
+  ingredients: RecipeIngredient[];
+}): string {
+  const ingredientText = input.ingredients.map((i) => i.item).join(", ");
+  return `${input.dish}${input.variationLabel ? ` (${input.variationLabel})` : ""}. ${input.summary ?? ""} ${ingredientText}`;
+}
+
+/**
+ * Inserts a new recipe, or updates the existing one for this exact
+ * dish + variationLabel pair — a NULL variation_label is treated as one
+ * single canonical slot per dish (matched explicitly via `.is(...)` below),
+ * not as always-distinct the way a plain DB unique constraint would treat
+ * NULLs, so saving over "the" recipe for a dish keeps updating the same row.
+ */
+export async function upsertRecipe(input: UpsertRecipeInput): Promise<Recipe> {
+  const supabase = getSupabaseAdmin();
+  const embedding = await embed(composeRecipeEmbedText(input), EMBED_MODEL);
+
+  const { data: existing, error: findError } = await (
+    input.variationLabel
+      ? supabase.from("recipes").select("id").eq("dish", input.dish).eq("variation_label", input.variationLabel)
+      : supabase.from("recipes").select("id").eq("dish", input.dish).is("variation_label", null)
+  ).maybeSingle();
+  if (findError) throw findError;
+
+  const payload = {
+    dish: input.dish,
+    variation_label: input.variationLabel,
+    ingredients: input.ingredients,
+    steps: input.steps,
+    summary: input.summary,
+    source_answer: input.sourceAnswer,
+    embedding,
+    updated_at: new Date().toISOString(),
+  };
+
+  if (existing) {
+    const { data, error } = await supabase
+      .from("recipes")
+      .update(payload)
+      .eq("id", existing.id)
+      .select(RECIPE_COLUMNS)
+      .single();
+    if (error) throw error;
+    return rowToRecipe(data as unknown as Database["public"]["Tables"]["recipes"]["Row"]);
+  }
+
+  const { data, error } = await supabase.from("recipes").insert(payload).select(RECIPE_COLUMNS).single();
+  if (error) throw error;
+  return rowToRecipe(data as unknown as Database["public"]["Tables"]["recipes"]["Row"]);
+}
+
+/** Deletes a recipe by id. */
+export async function deleteRecipe(id: string): Promise<void> {
+  const { error } = await getSupabaseAdmin().from("recipes").delete().eq("id", id);
+  if (error) throw error;
+}
+
+/** Per-dish activity summary — feeds the Recent tab's "Continue" section. */
+export type DishActivity = {
+  dish: string;
+  hasRecipe: boolean;
+  attemptCount: number;
+  /** Whichever is newer: the latest attempt, or the latest recipe save. */
+  lastActivityAt: string;
+  /** The latest attempt's own note text, or "Recipe saved" if a recipe save is what's most recent. */
+  lastActivityLabel: string;
+};
+
+/**
+ * Lists every dish that has an attempt or a saved recipe, most recently
+ * active first — "most recently active" being whichever is newer between
+ * that dish's latest logged attempt and its latest recipe save. Aggregated
+ * in JS rather than a SQL function: personal-scale data (tens of attempts,
+ * a handful of recipes), not worth a migration for.
+ */
+export async function listDishActivity(): Promise<DishActivity[]> {
+  const supabase = getSupabaseAdmin();
+
+  const [{ data: attemptRows, error: attemptsError }, { data: recipeRows, error: recipesError }] = await Promise.all([
+    supabase
+      .from("attempts")
+      .select("dish, created_at, changes, outcome, note")
+      .order("created_at", { ascending: false }),
+    supabase.from("recipes").select("dish, updated_at"),
+  ]);
+  if (attemptsError) throw attemptsError;
+  if (recipesError) throw recipesError;
+
+  type Acc = {
+    dish: string;
+    attemptCount: number;
+    lastAttemptAt: string | null;
+    lastAttemptLabel: string | null;
+    lastRecipeAt: string | null;
+  };
+  const byDish = new Map<string, Acc>();
+
+  function getAcc(dish: string): Acc {
+    let acc = byDish.get(dish);
+    if (!acc) {
+      acc = { dish, attemptCount: 0, lastAttemptAt: null, lastAttemptLabel: null, lastRecipeAt: null };
+      byDish.set(dish, acc);
+    }
+    return acc;
+  }
+
+  // Rows are ordered created_at desc, so the first row seen per dish is
+  // that dish's latest attempt.
+  for (const row of (attemptRows ?? []) as {
+    dish: string;
+    created_at: string;
+    changes: string | null;
+    outcome: string | null;
+    note: string;
+  }[]) {
+    const acc = getAcc(row.dish);
+    acc.attemptCount++;
+    if (!acc.lastAttemptAt) {
+      acc.lastAttemptAt = row.created_at;
+      acc.lastAttemptLabel = row.changes || row.outcome || row.note;
+    }
+  }
+
+  for (const row of (recipeRows ?? []) as { dish: string; updated_at: string }[]) {
+    const acc = getAcc(row.dish);
+    if (!acc.lastRecipeAt || row.updated_at > acc.lastRecipeAt) {
+      acc.lastRecipeAt = row.updated_at;
+    }
+  }
+
+  const result: DishActivity[] = [];
+  for (const acc of byDish.values()) {
+    const lastAttemptTime = acc.lastAttemptAt ? new Date(acc.lastAttemptAt).getTime() : -Infinity;
+    const lastRecipeTime = acc.lastRecipeAt ? new Date(acc.lastRecipeAt).getTime() : -Infinity;
+    const recipeIsNewer = lastRecipeTime > lastAttemptTime;
+    result.push({
+      dish: acc.dish,
+      hasRecipe: acc.lastRecipeAt !== null,
+      attemptCount: acc.attemptCount,
+      lastActivityAt: recipeIsNewer ? acc.lastRecipeAt! : acc.lastAttemptAt ?? acc.lastRecipeAt!,
+      lastActivityLabel: recipeIsNewer ? "Recipe saved" : acc.lastAttemptLabel ?? "Recipe saved",
+    });
+  }
+
+  result.sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime());
+  return result;
 }

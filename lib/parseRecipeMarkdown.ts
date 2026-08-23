@@ -157,3 +157,119 @@ export function parseRecipeMarkdown(markdown: string): ParsedRecipe | null {
     learnings,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Recipes layer (distinct from cook-mode above): saving a chat answer as a
+// recipes-table row needs *structured* {item, amount} ingredient pairs and a
+// one-line summary, not the combined display strings/learnings ParsedRecipe
+// returns. Kept as its own function/types rather than reshaping
+// parseRecipeMarkdown, so cook-mode (already shipped) is untouched by this.
+// ---------------------------------------------------------------------------
+
+export type RecipeIngredient = { item: string; amount: string | null };
+
+export type ExtractedRecipe = {
+  dish: string;
+  /** The one-line intro right after the dish heading (ANSWER_PROMPT's template puts one there). Null if the answer doesn't have one. */
+  summary: string | null;
+  ingredients: RecipeIngredient[];
+  steps: ParsedRecipeStep[];
+};
+
+/**
+ * Parses an assistant's markdown answer into the recipes table's shape.
+ * Returns null under the same condition as parseRecipeMarkdown: no numbered
+ * step list found at all (i.e. this answer doesn't look like a recipe).
+ */
+export function extractRecipeForSave(markdown: string): ExtractedRecipe | null {
+  const lines = markdown.split("\n");
+
+  let dish = "your cook";
+  let headingLineIndex = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const headingMatch = lines[i].match(/^#{1,3}\s+(.+)/);
+    if (headingMatch) {
+      dish = stripEmphasis(headingMatch[1]);
+      headingLineIndex = i;
+      break;
+    }
+  }
+
+  // Summary: the first non-empty, non-structural line right after the dish
+  // heading — ANSWER_PROMPT's template puts a one-line intro exactly there.
+  let summary: string | null = null;
+  if (headingLineIndex >= 0) {
+    for (let i = headingLineIndex + 1; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (trimmed === "") continue;
+      if (/^#{1,4}\s+/.test(trimmed) || /^\|/.test(trimmed) || /^[-*]\s+/.test(trimmed) || /^\d+[.)]\s+/.test(trimmed)) {
+        break;
+      }
+      summary = stripEmphasis(trimmed);
+      break;
+    }
+  }
+
+  // Ingredients, preferred source: the first markdown table — kept as
+  // structured {item, amount} pairs here (parseRecipeMarkdown joins these
+  // into one display string instead; this function doesn't).
+  const tableIngredients: RecipeIngredient[] = [];
+  let sawTable = false;
+  let tableRowIndex = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const isTableRow = /^\|.*\|$/.test(trimmed);
+    if (isTableRow) {
+      sawTable = true;
+      if (tableRowIndex >= 2) {
+        const cells = trimmed
+          .slice(1, -1)
+          .split("|")
+          .map((c) => stripEmphasis(c.trim()));
+        if (cells[0]) tableIngredients.push({ item: cells[0], amount: cells[1] || null });
+      }
+      tableRowIndex++;
+    } else if (sawTable && trimmed === "") {
+      if (tableIngredients.length > 0) break;
+      sawTable = false;
+      tableRowIndex = 0;
+    }
+  }
+
+  // Steps: identical extraction to parseRecipeMarkdown.
+  const steps: ParsedRecipeStep[] = [];
+  let inSteps = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const stepMatch = trimmed.match(/^\d+[.)]\s+(.+)/);
+    if (stepMatch) {
+      inSteps = true;
+      const text = stripEmphasis(stepMatch[1]);
+      steps.push({ text, minutes: extractMinutes(text) });
+    } else if (trimmed === "") {
+      if (inSteps && steps.length > 0) break;
+    } else if (inSteps && steps.length > 0 && !/^[#|>*-]/.test(trimmed)) {
+      steps[steps.length - 1].text += ` ${stripEmphasis(trimmed)}`;
+    }
+  }
+
+  if (steps.length === 0) return null;
+
+  // Ingredients fallback: a bullet list before the step list, if no table found.
+  const bulletIngredients: RecipeIngredient[] = [];
+  if (tableIngredients.length === 0) {
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (/^\d+[.)]\s+/.test(trimmed)) break;
+      const bulletMatch = trimmed.match(/^[-*]\s+(.+)/);
+      if (bulletMatch) bulletIngredients.push({ item: stripEmphasis(bulletMatch[1]), amount: null });
+    }
+  }
+
+  return {
+    dish,
+    summary,
+    ingredients: tableIngredients.length > 0 ? tableIngredients : bulletIngredients,
+    steps,
+  };
+}

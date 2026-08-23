@@ -294,6 +294,7 @@ async function consumeChatStream(
 export function ChatPanel({
   dish,
   onLogged,
+  onRecipeSaved,
   onCookRecipe,
   placeholder,
   emptyTitle,
@@ -301,6 +302,8 @@ export function ChatPanel({
 }: {
   dish?: string;
   onLogged?: () => void;
+  /** Called after "Save as recipe" successfully saves — e.g. the dish page refetches its recipe list. */
+  onRecipeSaved?: () => void;
   onCookRecipe: (recipe: CookModeData) => void;
   placeholder: string;
   emptyTitle: string;
@@ -435,6 +438,8 @@ export function ChatPanel({
                   turn.response?.type === "ask" && handleSaveGenerated(turn.id, turn.response.answer)
                 }
                 onCookRecipe={onCookRecipe}
+                onRecipeSaved={onRecipeSaved}
+                dish={dish}
               />
             )
           )
@@ -499,6 +504,8 @@ function AssistantTurn({
   saved,
   onSave,
   onCookRecipe,
+  onRecipeSaved,
+  dish,
 }: {
   response: AssistantResponse | null;
   phase: ChatPhase | null;
@@ -507,7 +514,15 @@ function AssistantTurn({
   saved: boolean;
   onSave: () => void;
   onCookRecipe: (recipe: CookModeData) => void;
+  onRecipeSaved?: () => void;
+  /** Dish-scoped chat forces the recipe's dish to this, same as LOG's auto-tagging — see /api/recipes. */
+  dish?: string;
 }) {
+  const [showVariationInput, setShowVariationInput] = useState(false);
+  const [variationLabel, setVariationLabel] = useState("");
+  const [savingRecipe, setSavingRecipe] = useState(false);
+  const [recipeSaved, setRecipeSaved] = useState(false);
+
   if (response === null) {
     return <StatusPill phase={phase ?? "thinking"} />;
   }
@@ -520,9 +535,34 @@ function AssistantTurn({
   }
 
   // response.type === "ask" — while streaming, re-parsing on every chunk is
-  // cheap (plain string scans) and lets "Let's cook this" appear the
-  // instant the step list finishes, not just once the whole answer lands.
+  // cheap (plain string scans) and lets "Let's cook this"/"Save as recipe"
+  // appear the instant the step list finishes, not just once the whole
+  // answer lands.
   const recipe = parseRecipeMarkdown(response.answer);
+
+  async function handleSaveRecipe() {
+    if (savingRecipe || recipeSaved || response?.type !== "ask") return;
+    setSavingRecipe(true);
+    try {
+      const res = await fetch("/api/recipes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sourceAnswer: response.answer,
+          variationLabel: variationLabel.trim() || null,
+          ...(dish && { dish }),
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setRecipeSaved(true);
+        setShowVariationInput(false);
+        onRecipeSaved?.();
+      }
+    } finally {
+      setSavingRecipe(false);
+    }
+  }
 
   return (
     <div className="min-w-0 rounded-2xl border border-hairline bg-card px-6 py-6 shadow-lift">
@@ -567,7 +607,60 @@ function AssistantTurn({
             Let&apos;s cook this
           </button>
         )}
+
+        {!streaming && recipe && !recipeSaved && !showVariationInput && (
+          <button
+            type="button"
+            onClick={() => setShowVariationInput(true)}
+            className="inline-flex items-center gap-2 rounded-xl border border-hairline bg-paper px-5 py-2.5 text-sm font-medium text-ink transition-colors hover:border-accent hover:text-accent"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+              <path
+                d="M19 21l-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"
+                stroke="currentColor"
+                strokeWidth={1.6}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            Save as recipe
+          </button>
+        )}
+
+        {recipeSaved && (
+          <span className="inline-flex items-center rounded-xl border border-hairline bg-paper px-5 py-2.5 text-sm font-medium text-ink-muted">
+            Saved as recipe ✓
+          </span>
+        )}
       </div>
+
+      {showVariationInput && !recipeSaved && (
+        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-dashed border-hairline bg-paper px-4 py-3">
+          <input
+            type="text"
+            value={variationLabel}
+            onChange={(e) => setVariationLabel(e.target.value)}
+            placeholder="Variation (optional) — e.g. ayam kampung, pressure cooker"
+            className="min-w-0 flex-1 rounded-lg border border-hairline bg-card px-3 py-1.5 text-sm text-ink placeholder:text-ink-faint focus:outline-none focus:ring-1 focus:ring-accent"
+          />
+          <button
+            type="button"
+            onClick={handleSaveRecipe}
+            disabled={savingRecipe}
+            className="shrink-0 rounded-lg bg-accent px-4 py-1.5 text-sm font-medium text-paper disabled:opacity-60"
+          >
+            {savingRecipe ? "Saving…" : "Save"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowVariationInput(false)}
+            disabled={savingRecipe}
+            className="shrink-0 rounded-lg border border-hairline px-3 py-1.5 text-sm text-ink-muted disabled:opacity-60"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
 
       <SourcesStrip matches={response.matches} />
     </div>
