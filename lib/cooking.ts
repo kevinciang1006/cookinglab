@@ -1503,14 +1503,10 @@ export async function checkSavedRecipe(
  * context, same as a model-generated answer would — and in the same
  * template shape, so cook-mode/"Save as recipe" parsing still works on it.
  */
-export async function buildAnswerFromSavedRecipe(recipe: Recipe): Promise<string> {
+function formatRecipeIngredientsAndSteps(recipe: Recipe): string {
   const lines: string[] = [];
-  lines.push(`## ${recipe.dish}${recipe.variationLabel ? ` (${recipe.variationLabel})` : ""}`);
-  lines.push("");
-  lines.push(recipe.summary ? `*Your saved recipe.* ${recipe.summary}` : "*Your saved recipe.*");
 
   if (recipe.ingredients.length > 0) {
-    lines.push("");
     lines.push("### Ingredients");
     lines.push("| Ingredient | Amount |");
     lines.push("|---|---|");
@@ -1520,9 +1516,24 @@ export async function buildAnswerFromSavedRecipe(recipe: Recipe): Promise<string
   }
 
   if (recipe.steps.length > 0) {
-    lines.push("");
+    if (lines.length > 0) lines.push("");
     lines.push("### Steps");
     recipe.steps.forEach((step, i) => lines.push(`${i + 1}. ${step.text}`));
+  }
+
+  return lines.join("\n");
+}
+
+export async function buildAnswerFromSavedRecipe(recipe: Recipe): Promise<string> {
+  const lines: string[] = [];
+  lines.push(`## ${recipe.dish}${recipe.variationLabel ? ` (${recipe.variationLabel})` : ""}`);
+  lines.push("");
+  lines.push(recipe.summary ? `*Your saved recipe.* ${recipe.summary}` : "*Your saved recipe.*");
+
+  const body = formatRecipeIngredientsAndSteps(recipe);
+  if (body) {
+    lines.push("");
+    lines.push(body);
   }
 
   // Supporting context only — degrade silently if it fails, never block
@@ -1539,6 +1550,174 @@ export async function buildAnswerFromSavedRecipe(recipe: Recipe): Promise<string
   }
 
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Follow-up modification requests ("adjust to 1kg", "double it", "no
+// shaoxing wine") — a dedicated short-circuit ahead of the RETRIEVE/ADAPT/
+// GENERATE routing, same pattern as cookAlong/checkSavedRecipe above.
+// Without conversation context, a bare "adjust to 1kg" has nothing to
+// ground on: classifyAskIntent sees a short, contextless message with weak
+// (often empty) attempt matches and typically falls through to GENERATE or
+// RETRIEVE — and on the dish page specifically, checkSavedRecipe's name
+// match fires on every message regardless of content (dishFilter is always
+// the dish's name), so it was silently re-returning the saved recipe
+// UNCHANGED instead of adapting it — confirmed live before this existed.
+// ---------------------------------------------------------------------------
+
+/** One prior turn of conversation — sent by the client so a follow-up like "adjust to 1kg" can be resolved against what was already discussed. */
+export type ConversationTurn = { role: "user" | "assistant"; content: string };
+
+function formatConversationHistory(history: ConversationTurn[]): string {
+  if (history.length === 0) return "";
+  return history.map((t) => `${t.role === "user" ? "User" : "Assistant"}: ${t.content}`).join("\n\n");
+}
+
+/** Same ingredients/steps as buildAnswerFromSavedRecipe, without the "Your saved recipe"/summary framing — this is model-facing context, not a user-facing answer. */
+function formatRecipeForContext(recipe: Recipe): string {
+  const lines: string[] = [`## ${recipe.dish}${recipe.variationLabel ? ` (${recipe.variationLabel})` : ""}`];
+  if (recipe.summary) {
+    lines.push("");
+    lines.push(recipe.summary);
+  }
+  const body = formatRecipeIngredientsAndSteps(recipe);
+  if (body) {
+    lines.push("");
+    lines.push(body);
+  }
+  return lines.join("\n");
+}
+
+/** "The recipe currently in context" for a modification request, plus where it came from (used to phrase the answer's framing line correctly). */
+export type RecipeContext = { text: string; source: "saved" | "conversation" };
+
+/**
+ * Resolves "the recipe currently in context" for a modification request —
+ * dish-scoped chat gets its saved recipe by default (so "adjust to 1kg"
+ * works as the very first message, no need to have already asked for the
+ * recipe this session); otherwise falls back to the most recent assistant
+ * turn in `history`, if it reads like a recipe (has an "### Ingredients"
+ * section). Returns null if neither is available — callers treat that as
+ * "nothing to adapt" and fall through to the normal RETRIEVE/ADAPT/GENERATE
+ * routing.
+ */
+export async function resolveRecipeContext(
+  dishFilter: string | undefined,
+  history: ConversationTurn[]
+): Promise<RecipeContext | null> {
+  if (dishFilter) {
+    const saved = await findRecipeByNormalizedName(dishFilter);
+    if (saved) return { text: formatRecipeForContext(saved), source: "saved" };
+  }
+  for (let i = history.length - 1; i >= 0; i--) {
+    const turn = history[i];
+    if (turn.role === "assistant" && /###\s*ingredients/i.test(turn.content)) {
+      return { text: turn.content, source: "conversation" };
+    }
+  }
+  return null;
+}
+
+const RECIPE_MODIFICATION_PROMPT = `Does the user's message ask to modify, scale, adjust, or substitute
+something in a recipe that was already given — e.g. "adjust to 1kg", "double
+it", "halve the recipe", "make it for 4 people", "no shaoxing wine", "swap
+the pork for chicken" — rather than asking a new question, a "why"/
+diagnostic question, or requesting a completely different dish?
+Return ONLY a JSON object: {"isModification": true | false}`;
+
+/** Detects a follow-up modification request ("adjust to 1kg"), ahead of the RETRIEVE/ADAPT/GENERATE routing. Only meaningful when there's a recipe in context — callers should only act on `true` when resolveRecipeContext also returned non-null. */
+export async function classifyRecipeModification(question: string): Promise<boolean> {
+  const text = await callModel({
+    model: CLASSIFY_MODEL,
+    contents: question,
+    systemInstruction: RECIPE_MODIFICATION_PROMPT,
+    label: "recipe-modification",
+    errorClass: AnswerError,
+    temperature: 0,
+    maxOutputTokens: 200,
+    json: true,
+  });
+
+  let parsed: { isModification?: boolean };
+  try {
+    parsed = JSON.parse(text) as { isModification?: boolean };
+  } catch {
+    throw new AnswerError("Ollama returned unparsable recipe-modification classification JSON");
+  }
+
+  return parsed.isModification === true;
+}
+
+const ADAPT_FROM_CONTEXT_PROMPT = `The user wants to modify a recipe that's already in view — scaling,
+substituting an ingredient, adjusting for a different serving size, or
+removing/changing something. You'll be given that recipe and the requested
+change. Follow this exact template:
+
+## <Dish Name>
+*Adjusted from <match how the recipe was introduced below — "your saved recipe" or "the recipe already discussed"> (<original amount/serving> → <new amount/serving>).*
+
+### Ingredients
+| Ingredient | Amount |
+|---|---|
+<one row per ingredient, scaled/adjusted for the requested change>
+
+### Steps
+1. <step>
+2. <step — **bold** anything you changed from the original because of this adjustment>
+...
+
+### What changed
+- <each adjustment you made and why — e.g. "steam time raised from 6 to 8 min: a denser 1kg fillet takes longer to reach the same doneness than 500g, not a straight 2x">
+
+Rules:
+- Scale ingredient AMOUNTS proportionally to the requested change (e.g. 500g
+  to 1kg doubles every ingredient quantity; serving 2 people to 4 doubles
+  everything).
+- Do NOT scale everything else linearly — apply real cooking judgment:
+  cook time/heat does not simply double because mass doubles (a thicker/
+  denser piece of food conducts heat slower — it usually needs MORE than a
+  linear increase, but never assume a flat 2x without reasoning about it),
+  and seasoning (salt, spice, aromatics) usually scales sub-linearly, not
+  perfectly 1:1 with mass. Explain what you changed and why in "### What
+  changed" — don't just change numbers silently.
+- If the request removes or substitutes one ingredient, adjust only that
+  ingredient/the steps that touch it — don't rewrite the rest of the recipe.
+- Keep the same dish and structure as the recipe you were given — this is
+  an adjustment, not a new recipe. Never invent an ingredient that wasn't in
+  the original.`;
+
+/**
+ * ADAPT-from-context: applies a modification request (scaling,
+ * substitution, serving-size change) to `context` — the recipe already in
+ * view (a saved recipe, or the most recent assistant turn), grounded
+ * further by the recent conversation. Distinct from synthesizeAdaptation
+ * above, which grounds in logged *attempts* rather than a recipe already on
+ * screen.
+ */
+export function synthesizeRecipeAdaptationStream(
+  question: string,
+  context: RecipeContext,
+  history: ConversationTurn[]
+): AsyncGenerator<string, void, unknown> {
+  const sourceLabel = context.source === "saved" ? "your saved recipe" : "the recipe already discussed in this conversation";
+  const historyText = formatConversationHistory(history);
+  const userContent = [
+    `Recipe currently in context (this is ${sourceLabel}):\n${context.text}`,
+    historyText ? `Recent conversation so far:\n${historyText}` : null,
+    `User's request: ${question}`,
+  ]
+    .filter((part): part is string => part !== null)
+    .join("\n\n");
+
+  return callModelStream({
+    model: ANSWER_MODEL,
+    contents: userContent,
+    systemInstruction: ADAPT_FROM_CONTEXT_PROMPT,
+    label: "adapt-from-context",
+    errorClass: AnswerError,
+    think: "low",
+    keepAlive: GPT_OSS_KEEP_ALIVE,
+  });
 }
 
 /** Per-dish activity summary — feeds the Recent tab's "Continue" section. */

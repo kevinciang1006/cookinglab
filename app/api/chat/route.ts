@@ -13,6 +13,9 @@ import {
   detectCookAlongIntent,
   checkSavedRecipe,
   buildAnswerFromSavedRecipe,
+  resolveRecipeContext,
+  classifyRecipeModification,
+  synthesizeRecipeAdaptationStream,
   regenerateDishMemory,
   RELEVANCE_THRESHOLD,
   EMBED_MODEL,
@@ -21,6 +24,7 @@ import {
   type AttemptMatch,
   type AskPath,
   type CookRecipe,
+  type ConversationTurn,
 } from "@/lib/cooking";
 
 export type ChatResponse =
@@ -108,13 +112,21 @@ function streamChat(run: (emit: (event: ChatStreamEvent) => void) => Promise<voi
  *   attempt is force-tagged with it regardless of what the parser inferred
  *   — "logging from here auto-tags the dish."
  */
+// How many recent turns the client's history is trimmed to server-side too
+// (defense in depth — the client already caps what it sends). Kept small:
+// this only needs to cover the last exchange or two for a follow-up like
+// "adjust to 1kg" to resolve, not the whole conversation.
+const MAX_HISTORY_TURNS = 8;
+
 export async function POST(request: Request) {
   let message: unknown;
   let dish: unknown;
+  let history: unknown;
   try {
     const body = await request.json();
     message = body?.message;
     dish = body?.dish;
+    history = body?.history;
   } catch {
     return NextResponse.json<ChatResponse>(
       askError("That request didn't look right — try again.")
@@ -127,6 +139,22 @@ export async function POST(request: Request) {
 
   const trimmed = message.trim();
   const dishFilter = typeof dish === "string" && dish.trim().length > 0 ? dish.trim() : undefined;
+
+  // Conversation history — recent turns only, so a follow-up like "adjust to
+  // 1kg" can be resolved against what was already discussed rather than
+  // reconstructed from nothing. Sanitized defensively since it's
+  // client-supplied: each entry must have a role and non-empty string
+  // content, everything else is dropped rather than rejecting the request.
+  const parsedHistory: ConversationTurn[] = Array.isArray(history)
+    ? history
+        .filter((turn): turn is { role: unknown; content: unknown } => turn !== null && typeof turn === "object")
+        .map((turn) => ({
+          role: turn.role === "assistant" ? ("assistant" as const) : ("user" as const),
+          content: typeof turn.content === "string" ? turn.content.trim() : "",
+        }))
+        .filter((turn) => turn.content.length > 0)
+        .slice(-MAX_HISTORY_TURNS)
+    : [];
   // Only used for LLM-facing calls (classify/synthesize), not for embedding
   // — biases the model's reasoning toward the scoped dish without changing
   // what gets embedded/matched.
@@ -203,7 +231,28 @@ export async function POST(request: Request) {
 
       // QUERY — mirrors the /api/ask agent, optionally scoped to one dish.
       emit({ type: "status", phase: "searching" });
-      const queryEmbedding = await embed(trimmed, EMBED_MODEL);
+
+      // Follow-up modification requests ("adjust to 1kg", "double it") —
+      // checked before anything else. Dish-scoped chat gets its saved
+      // recipe as context by default (so this works as the very first
+      // message); resolving it costs no model call, so doing this up front
+      // is free when there's nothing to find.
+      const recipeContext = await resolveRecipeContext(dishFilter, parsedHistory);
+
+      const [queryEmbedding, isModification] = await Promise.all([
+        embed(trimmed, EMBED_MODEL),
+        recipeContext ? classifyRecipeModification(contextualMessage) : Promise.resolve(false),
+      ]);
+
+      if (recipeContext && isModification) {
+        emit({ type: "status", phase: "thinking" });
+        emit({ type: "meta", meta: { type: "ask", path: "ADAPT", matches: [], savable: false } });
+        for await (const chunk of synthesizeRecipeAdaptationStream(contextualMessage, recipeContext, parsedHistory)) {
+          emit({ type: "token", text: chunk });
+        }
+        return;
+      }
+
       const [candidates, cookAlong] = await Promise.all([
         matchAttempts(queryEmbedding, MATCH_COUNT, dishFilter),
         detectCookAlongIntent(contextualMessage),

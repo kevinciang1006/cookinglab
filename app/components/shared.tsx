@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { Attempt, AttemptMatch, AskPath } from "@/lib/cooking";
+import type { Attempt, AttemptMatch, AskPath, ConversationTurn } from "@/lib/cooking";
 import type { ChatResponse, ChatPhase, ChatStreamEvent, ChatStreamMeta } from "@/app/api/chat/route";
 import { generateId } from "@/lib/id";
 import { MarkdownMessage } from "@/app/components/MarkdownMessage";
@@ -178,6 +178,25 @@ const STREAM_STALL_MS = 45_000;
 // keeps the turn renderable instead of throwing if it ever does).
 const DEFAULT_ASK_META: ChatStreamMeta = { type: "ask", path: "RETRIEVE", matches: [], savable: false };
 
+// How many recent turns to send as conversation history with each request —
+// enough for a follow-up like "adjust to 1kg" to resolve against the last
+// exchange, without growing the request unboundedly as a chat gets long.
+const HISTORY_TURN_LIMIT = 8;
+
+/** Converts the on-screen turns into the plain {role, content} history the server expects — skips turns still pending/streaming (no response yet) and system-y turns with nothing worth repeating. */
+function turnsToHistory(turns: ChatTurn[]): ConversationTurn[] {
+  const history: ConversationTurn[] = [];
+  for (const turn of turns) {
+    if (turn.role === "user") {
+      history.push({ role: "user", content: turn.text });
+    } else if (turn.response) {
+      const content = turn.response.type === "ask" ? turn.response.answer : turn.response.reply;
+      if (content) history.push({ role: "assistant", content });
+    }
+  }
+  return history.slice(-HISTORY_TURN_LIMIT);
+}
+
 /**
  * Reads the unified SSE stream from POST /api/chat and progressively
  * updates the one turn it belongs to: "status" sets the loading pill's
@@ -323,6 +342,11 @@ export function ChatPanel({
     const text = input.trim();
     if (!text || pending) return;
 
+    // Captured from state as it stands *before* this new user turn is
+    // appended — exactly "the recent turns", so a follow-up like "adjust to
+    // 1kg" can be resolved against the answer that was already on screen.
+    const history = turnsToHistory(turns);
+
     setTurns((prev) => [...prev, { id: generateId(), role: "user", text }]);
     setInput("");
     setPending(true);
@@ -330,7 +354,7 @@ export function ChatPanel({
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(dish ? { message: text, dish } : { message: text }),
+        body: JSON.stringify(dish ? { message: text, dish, history } : { message: text, history }),
       });
 
       // Every real outcome streams now (status pills before/instead of
